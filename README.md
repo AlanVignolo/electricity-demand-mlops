@@ -165,6 +165,33 @@ Batch es como 280 veces más rápido en throughput total — tiene sentido, scik
 uv run python scripts/compare_batch_streaming.py
 ```
 
+## Aprendizaje Federado
+
+Esto es aparte del resto del proyecto — no usa el modelo de demanda eléctrica (FedAvg promedia pesos de un modelo paramétrico, y un Random Forest no se presta a eso sin cambiar de modelo), así que lo armé con el dataset `digits` de scikit-learn que permite el enunciado, siguiendo el tutorial de la cátedra.
+
+Notebook: `notebooks/06_federated_learning.ipynb`. Un clasificador softmax (W, b) entrenado con SGD manual en numpy, repartiendo el dataset entre 5 "clientes" que nunca comparten sus datos entre sí — solo mandan sus pesos entrenados localmente al servidor, que los promedia (FedAvg).
+
+Resultados:
+
+```
+Centralizado:        0.967
+Federado (IID):       0.973
+Federado (non-IID):   0.769
+```
+
+Con los datos repartidos de forma pareja entre clientes (IID), el federado prácticamente empata al centralizado — no perdés nada por no mover los datos. Repartiendo distinto, de forma que cada cliente solo ve 3 de las 10 clases de dígitos (non-IID, heterogeneidad fuerte), la accuracy cae bastante: cada cliente optimiza para lo poco que ve, y promediar esos pesos tan distintos no da un buen modelo global.
+
+También medí el trade-off privacidad vs performance con DP-FedAvg (cada cliente recorta su actualización a una norma máxima y le suma ruido gaussiano antes de mandarla):
+
+```
+noise_std=0.00 -> 0.956
+noise_std=0.01 -> 0.969
+noise_std=0.05 -> 0.960
+noise_std=0.10 -> 0.947
+```
+
+Con poco ruido casi no se nota (incluso subió un poco, puede estar actuando como regularizador), pero a partir de ahí cae de forma consistente a medida que subo el ruido — exactamente el trade-off que se espera: más privacidad, peor performance.
+
 ## Linaje (Neo4j)
 
 `scripts/seed_neo4j.py` lee el modelo activo de MLflow y arma el grafo: dataset crudo, dataset limpio, una feature por cada columna que usa el modelo, el experimento y el modelo, todo conectado. Se puede correr de nuevo sin duplicar nada.

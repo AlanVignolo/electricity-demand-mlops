@@ -13,8 +13,9 @@ Este documento explica la teoría detrás de cada parte del proyecto, por qué s
 7. [Mini-TP 2: API GraphQL y linaje con Neo4j](#7-mini-tp-2-api-graphql-y-linaje-con-neo4j)
 8. [Mini-TP 3: API gRPC](#8-mini-tp-3-api-grpc)
 9. [Mini-TP 4: streaming con Kafka/Redpanda](#9-mini-tp-4-streaming-con-kafkaredpanda)
-10. [CI/CD](#10-cicd)
-11. [Decisiones de alcance y qué quedó afuera](#11-decisiones-de-alcance-y-qué-quedó-afuera)
+10. [Mini-TP 5: aprendizaje federado](#10-mini-tp-5-aprendizaje-federado)
+11. [CI/CD](#11-cicd)
+12. [Decisiones de alcance y qué quedó afuera](#12-decisiones-de-alcance-y-qué-quedó-afuera)
 
 ---
 
@@ -252,17 +253,59 @@ Batch resultó **~280 veces más rápido en throughput total**. La razón es est
 
 Pero ese número no responde la pregunta de cuál conviene — responde solo "cuál mueve más volumen en menos tiempo total". La pregunta que importa en un sistema real es otra: ¿cuánto tardo en tener *una* predicción lista desde que *ese* dato puntual está disponible? En batch, ninguna predicción está lista hasta que el lote completo terminó de procesarse — si el lote se arma una vez por hora, la predicción más temprana del lote espera hasta una hora para estar disponible. En streaming, cada predicción está lista casi al instante de que llega su evento (en este caso, en el orden de los 50-70ms medidos). Streaming sacrifica throughput agregado a cambio de latencia de respuesta por evento individual — la elección correcta depende de si el caso de uso necesita "la predicción de este evento, ya" o "las predicciones de este lote, en algún momento cercano".
 
-## 10. CI/CD
+## 10. Mini-TP 5: aprendizaje federado
+
+### 10.1. Por qué este mini-TP no usa el modelo de demanda eléctrica
+
+Aprendizaje federado (FedAvg) funciona promediando los **parámetros** de un modelo paramétrico — pesos de una red neuronal, de una regresión, de un clasificador lineal. Un Random Forest no tiene un conjunto fijo de parámetros que se puedan promediar de esa forma (cada árbol es una estructura discreta distinta, entrenada con splits propios) — "promediar" dos Random Forest no tiene un equivalente directo y natural al promedio ponderado de FedAvg. Adaptar el proyecto de demanda eléctrica a este paradigma hubiese requerido cambiar de familia de modelo (por ejemplo, a una red neuronal), lo cual es una reescritura de fondo del pipeline, no una extensión — dado el apuro de tiempo de la entrega, se priorizó seguir el enunciado con el dataset alternativo que permite explícitamente (`digits`, de scikit-learn), siguiendo el notebook-tutorial de la cátedra.
+
+### 10.2. Qué es FedAvg y por qué "solo se mandan parámetros"
+
+La idea central del aprendizaje federado: en vez de centralizar los datos de todos los participantes en un solo lugar para entrenar (lo habitual), el modelo **viaja** a donde están los datos. Cada cliente entrena localmente con sus propios datos, que nunca salen de su posesión, y solo manda al servidor los **parámetros resultantes** de ese entrenamiento local — nunca los datos en sí. El servidor agrega esos parámetros (en el caso más simple, FedAvg, con un promedio ponderado por cuántos datos tiene cada cliente: `w_global = Σ (n_k/n) w_k`) y distribuye el modelo global actualizado de vuelta a los clientes para la próxima ronda.
+
+Esto es relevante cuando centralizar el dato no es posible o no conviene: regulaciones de privacidad (datos médicos, financieros), latencia/conectividad intermitente (dispositivos móviles), o simplemente porque el volumen de datos distribuidos es demasiado grande para mover.
+
+### 10.3. Implementación: softmax desde cero en numpy
+
+Siguiendo el tutorial de la cátedra (`clase5/Practica/federated_tutorial.ipynb`), se implementó un clasificador softmax (regresión logística multiclase) completamente desde cero en numpy — sin usar `scikit-learn` para el modelo en sí — porque sus parámetros son exactamente una matriz de pesos `W` y un vector de sesgos `b`, el caso más simple y transparente para mostrar qué es lo que efectivamente "viaja" entre cliente y servidor en FedAvg: esos dos arrays, nada más.
+
+- `entrenar_local(W_glob, b_glob, Xc, yc, ...)`: parte del modelo global recibido, entrena unas pocas épocas de SGD solo con los datos del cliente, devuelve los pesos actualizados y cuántos datos usó.
+- `fedavg(actualizaciones)`: en el servidor, promedia los `(W, b)` de los clientes que participaron en la ronda, ponderado por `n_k` (cantidad de datos de cada cliente) — así un cliente con más datos influye proporcionalmente más en el modelo global, en vez de que todos pesen igual sin importar cuánta señal aportaron.
+- `federado(clientes, R, frac, ...)`: orquesta `R` rondas de comunicación; en cada ronda selecciona una fracción (`frac`) de clientes al azar (simula que no todos los clientes están siempre disponibles — un escenario realista en dispositivos móviles, por ejemplo) y aplica el ciclo entrenar local → agregar en servidor.
+
+### 10.4. Resultado 1: IID vs centralizado
+
+Con el dataset repartido de forma homogénea entre 5 clientes (**IID** — cada cliente tiene una muestra representativa de las 10 clases, en proporciones similares), el resultado federado (accuracy **0.973**) prácticamente empató al centralizado (**0.967**, entrenado con todos los datos juntos en un solo lugar). Esto confirma el resultado teórico central de FedAvg: cuando los datos están distribuidos de forma pareja, no mover los datos no tiene casi ningún costo en calidad del modelo.
+
+### 10.5. Resultado 2: el costo de non-IID
+
+Se repitió el experimento con una partición deliberadamente heterogénea: cada cliente ve datos de solo **3 de las 10 clases** de dígitos (en vez de las 10 mezcladas). La accuracy federada cayó a **0.769**, una diferencia considerable respecto al 0.973 anterior. La explicación: cada cliente entrena un modelo local que se especializa en las pocas clases que ve, optimizando una función de pérdida distinta a la del problema global — cuando el servidor promedia esos pesos tan dispares entre sí, el resultado es un compromiso que no representa bien a ninguno de los clientes individuales. Este es justamente el desafío de "datos non-IID" que menciona la teoría del curso como uno de los puntos más difíciles de resolver en sistemas federados reales (donde, además, casi nunca los datos están limpiamente distribuidos entre participantes).
+
+### 10.6. Resultado 3: el trade-off privacidad vs performance (DP-FedAvg)
+
+Se implementó una versión con privacidad diferencial simple: antes de mandar su actualización de pesos al servidor, cada cliente la **recorta** a una norma L2 máxima fija (acota cuánto puede influir un solo cliente en la actualización agregada — limita la "sensibilidad" de la contribución) y le agrega **ruido gaussiano** calibrado por un parámetro `noise_std`. Cuanto más ruido, más difícil es para un observador externo (o un servidor malicioso) inferir información precisa sobre los datos de un cliente individual a partir de su actualización — pero también más se degrada la señal útil que llega al modelo.
+
+```
+noise_std=0.00 -> accuracy 0.956
+noise_std=0.01 -> accuracy 0.969
+noise_std=0.05 -> accuracy 0.960
+noise_std=0.10 -> accuracy 0.947
+```
+
+Con ruido bajo (0.01) el efecto fue casi nulo — de hecho levemente mejor que sin ruido en absoluto, posiblemente porque un ruido chico actúa parecido a una regularización, atenuando el sobreajuste de los clientes individuales. A partir de ahí, la accuracy cae de forma consistente al subir el ruido — el trade-off medible que pide el enunciado: ganar privacidad (más ruido, menos información filtrada por cliente) cuesta calidad del modelo global, y la relación no es necesariamente lineal desde el principio (el primer tramo de ruido es casi gratis).
+
+## 11. CI/CD
 
 El workflow de GitHub Actions (`.github/workflows/ci.yml`) corre en cada push a `main`: instala dependencias con `uv`, corre el linter (`ruff check .`), y verifica que los módulos centrales del pipeline (`data`, `features`, `train`) se puedan importar sin errores.
 
 **Por qué no entrena ni levanta las APIs en el CI:** en una etapa temprana del proyecto, cuando el modelo se guardaba como archivos `.joblib` sueltos, el CI sí entrenaba un modelo en modo rápido y probaba la API end-to-end contra un servidor real. Al integrar MLflow, esto dejó de ser viable sin más trabajo: entrenar y servir el modelo ahora requieren Postgres, MinIO y MLflow corriendo, que el runner de GitHub Actions no tiene por defecto. Levantar todo ese stack dentro del CI (con sus healthchecks, creación de bucket, etc.) es una inversión de infraestructura considerable para el beneficio que aporta en esta etapa del proyecto — quedó documentado como decisión consciente, no como una limitación no notada. El CI actual es honesto sobre lo que garantiza: código bien formateado y sin errores triviales de import, no una corrida end-to-end del sistema completo.
 
-## 11. Decisiones de alcance y qué quedó afuera
+## 12. Decisiones de alcance y qué quedó afuera
 
 - **Orden de trabajo — infraestructura containerizada desde el principio, no al final:** se decidió explícitamente ir sumando cada pieza (MLflow, luego Neo4j, luego cada API, luego Redpanda) directamente como servicios de Docker Compose a medida que se armaban, en vez de resolver todo en local primero y containerizar recién al final. La ventaja de containerizar temprano es que el entorno final se prueba de entrada, en vez de descubrir problemas de containerización (como los de red interna descriptos en 5.3) recién al empaquetar un sistema ya grande.
 - **Adelantar tecnologías de clases posteriores:** Docker, MLflow, streaming, y el nivel de contenedores en general corresponden a clases más avanzadas del curso (MLflow se presenta formalmente en la Clase 2, Docker se profundiza en la Sesión 5, streaming es la Sesión 4) — se decidió avanzar con ellas de todos modos, conscientes de que un enfoque distinto presentado más adelante en el curso podría requerir ajustes.
 - **Airflow no se implementó todavía.** Es el orquestador que falta para completar el conjunto de herramientas que pide `CriteriosAprobacion.md` para el nivel contenedores (que exige explícitamente "un servicio de orquestación y algún servicio de ciclo de vida de modelos" — MLflow ya cubre lo segundo). Queda como próximo paso natural: un DAG que dispare `train.py` según un cronograma o disparador, en vez de correrlo a mano.
-- **El CI no cubre el sistema completo**, como se explica en la sección 10 — es una limitación conocida y documentada, no un descuido.
+- **El CI no cubre el sistema completo**, como se explica en la sección 11 — es una limitación conocida y documentada, no un descuido.
+- **El Mini-TP 5 (federado) es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
 - **El consumidor y los productores de streaming no están containerizados.** A diferencia de las tres APIs (procesos de servidor persistentes, con un ciclo de vida claro de "levantar y dejar corriendo"), el consumidor de Kafka es un proceso de larga vida pero los productores son scripts de una sola pasada — no tienen el mismo encaje natural en un `docker-compose.yml` pensado para servicios. Quedaron como scripts que se corren a mano con `uv run`, contra el broker Redpanda que sí está containerizado.
 - **El Hito TP #1 grupal** (equipo, roles, diagrama de arquitectura — mencionado en el enunciado de la Sesión 4) está fuera del alcance de este documento, que cubre el trabajo individual sobre el modelo de demanda eléctrica.

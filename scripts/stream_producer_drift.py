@@ -26,9 +26,10 @@ def main():
     )
 
     print(
-        f"Emitiendo {len(df)} eventos al topic '{TOPIC}' "
-        f"con temperaturas fijas de {FIXED_HOT_TEMP}°C en las 5 ciudades (simulación de ola de calor extrema)..."
+        f"Emitiendo {len(df)} eventos al topic '{TOPIC}' con temperaturas fijas "
+        f"de {FIXED_HOT_TEMP}°C en las 5 ciudades (simulación de ola de calor extrema)..."
     )
+
     for timestamp, row in df.iterrows():
         event = {
             "timestamp": timestamp.isoformat(),

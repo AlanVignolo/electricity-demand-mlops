@@ -22,7 +22,7 @@ def main():
         bootstrap_servers=BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
     )
-    
+
     print(f"Emitiendo {len(df)} eventos al topic '{TOPIC}'...")
     for timestamp, row in df.iterrows():
         event = {

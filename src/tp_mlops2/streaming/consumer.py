@@ -2,12 +2,18 @@ import json
 import statistics
 import time
 
+import pandas as pd
 from kafka import KafkaConsumer
 from mlflow.tracking import MlflowClient
 
 from tp_mlops2.features import add_cyclical_features
-from tp_mlops2.predict import MLFLOW_TRACKING_URI, MODEL_ALIAS, REGISTERED_MODEL_NAME, load_model, predict
-import pandas as pd
+from tp_mlops2.predict import (
+    MLFLOW_TRACKING_URI,
+    MODEL_ALIAS,
+    REGISTERED_MODEL_NAME,
+    load_model,
+    predict,
+)
 
 TOPIC = "demanda-eventos"
 BOOTSTRAP_SERVERS = "localhost:9092"
@@ -26,7 +32,7 @@ def get_reference_stats():
     model_version = client.get_model_version_by_alias(name=REGISTERED_MODEL_NAME, alias=MODEL_ALIAS)
     run = client.get_run(model_version.run_id)
     metrics = run.data.metrics
-    
+
     if "mean_pred_mw" in metrics and "std_pred_mw" in metrics:
         return metrics["mean_pred_mw"], metrics["std_pred_mw"], "MLflow (test 2018)"
     return None, None, None
@@ -104,7 +110,11 @@ def main():
             )
 
             if abs(drift_z) > DRIFT_THRESHOLD_STD:
-                print(f"  ALERTA: drift de {drift_z:+.2f} desvíos respecto a la referencia ({ref_source})")
+                print(
+                    f"  ALERTA: drift de {drift_z:+.2f} desvíos "
+                    f"respecto a la referencia ({ref_source})"
+                )
+
 
             window_preds = []
             window_latencies = []

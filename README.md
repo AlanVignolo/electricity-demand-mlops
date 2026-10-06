@@ -192,6 +192,30 @@ noise_std=0.10 -> 0.947
 
 Con poco ruido casi no se nota (incluso subió un poco, puede estar actuando como regularizador), pero a partir de ahí cae de forma consistente a medida que subo el ruido — exactamente el trade-off que se espera: más privacidad, peor performance.
 
+## Data Lake (MinIO)
+
+Un bucket separado (`datalake`, distinto del `mlflow-artifacts` que usa MLflow internamente) con tres zonas, siguiendo el patrón raw → curated → models del Data Lake.
+
+```powershell
+uv run python scripts/upload_to_datalake.py
+```
+
+Sube `energy_dataset.csv` y `weather_features.csv` a `raw/`, el parquet limpio a `curated/`, y una copia versionada del modelo activo (bajada de MLflow y resubida como joblib puro) a `models/v1/`.
+
+```python
+from tp_mlops2.datalake import predict_from_lake
+```
+
+`src/tp_mlops2/datalake.py` carga el modelo **directo del lake con boto3**, sin pasar por MLflow — un camino de carga completamente aparte del que usan las tres APIs. Lo probé con el mismo caso de siempre y dio la misma predicción (30694.1 MW), así que ambos caminos son consistentes.
+
+```powershell
+uv run python -m tp_mlops2.datalake
+```
+
+**¿Por qué servir desde el lake en vez de empaquetar el modelo dentro de la imagen Docker?** Lo que gano: no tengo que rebuildear la imagen cada vez que reentreno — subo el artefacto nuevo al lake y el contenedor lo trae al reiniciar, sin tocar el `Dockerfile`. La imagen queda más genérica, no lleva pegado un modelo específico de 32MB. El lake además retiene el historial de versiones por su cuenta, separado de qué imagen está corriendo en cada momento, así que puedo auditar qué modelo estuvo activo en una fecha sin rastrear tags de Docker. Y separa responsabilidades: quien entrena puede publicar un modelo nuevo sin coordinar un deploy de infraestructura.
+
+Lo que pierdo: el arranque es más lento (el contenedor tiene que bajar el modelo al iniciar — en este proyecto, unos 30 segundos la primera vez) y la API pasa a depender de que MinIO esté arriba en ese momento; un modelo horneado en la imagen no tiene esa dependencia externa al arrancar.
+
 ## Linaje (Neo4j)
 
 `scripts/seed_neo4j.py` lee el modelo activo de MLflow y arma el grafo: dataset crudo, dataset limpio, una feature por cada columna que usa el modelo, el experimento y el modelo, todo conectado. Se puede correr de nuevo sin duplicar nada.

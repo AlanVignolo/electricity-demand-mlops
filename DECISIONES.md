@@ -14,8 +14,9 @@ Este documento explica la teoría detrás de cada parte del proyecto, por qué s
 8. [Mini-TP 3: API gRPC](#8-mini-tp-3-api-grpc)
 9. [Mini-TP 4: streaming con Kafka/Redpanda](#9-mini-tp-4-streaming-con-kafkaredpanda)
 10. [Mini-TP 5: aprendizaje federado](#10-mini-tp-5-aprendizaje-federado)
-11. [CI/CD](#11-cicd)
-12. [Decisiones de alcance y qué quedó afuera](#12-decisiones-de-alcance-y-qué-quedó-afuera)
+11. [Mini-TP 6: Data Lake](#11-mini-tp-6-data-lake)
+12. [CI/CD](#12-cicd)
+13. [Decisiones de alcance y qué quedó afuera](#13-decisiones-de-alcance-y-qué-quedó-afuera)
 
 ---
 
@@ -294,18 +295,60 @@ noise_std=0.10 -> accuracy 0.947
 
 Con ruido bajo (0.01) el efecto fue casi nulo — de hecho levemente mejor que sin ruido en absoluto, posiblemente porque un ruido chico actúa parecido a una regularización, atenuando el sobreajuste de los clientes individuales. A partir de ahí, la accuracy cae de forma consistente al subir el ruido — el trade-off medible que pide el enunciado: ganar privacidad (más ruido, menos información filtrada por cliente) cuesta calidad del modelo global, y la relación no es necesariamente lineal desde el principio (el primer tramo de ruido es casi gratis).
 
-## 11. CI/CD
+## 11. Mini-TP 6: Data Lake
+
+### 11.1. Data Lake vs Data Warehouse, y por qué importa para ML
+
+Un Data Warehouse tradicional impone un esquema **antes** de escribir el dato (schema-on-write): hay que transformarlo y limpiarlo para que encaje en tablas predefinidas antes de que exista en el sistema. Un Data Lake invierte el orden — guarda el dato **crudo**, tal como llega, en cualquier formato, y el esquema se aplica recién al leerlo (schema-on-read). Para Machine Learning esto importa especialmente: el dato crudo sin transformar es valioso en sí mismo (un feature que hoy parece irrelevante puede ser útil en un modelo futuro), y forzar un esquema rígido de antemano puede destruir información antes de saber si hacía falta.
+
+El riesgo de este enfoque es terminar con un **data swamp** — un lake sin organización, donde nadie sabe qué hay ni en qué estado está. El antídoto son **zonas**: `raw` (el dato tal cual llegó, sin tocar), `staged`/`curated` (ya limpio, transformado, listo para consumir), y en este proyecto se agregó una tercera zona, `models`, para los artefactos de modelos versionados — una extensión natural del mismo patrón de zonas aplicado no a datos sino a artefactos de ML.
+
+### 11.2. Por qué un bucket separado del de MLflow
+
+El proyecto ya tenía un bucket (`mlflow-artifacts`) que usa MLflow internamente como artifact store — ahí es donde `mlflow.sklearn.log_model()` sube el modelo cuando se llama desde `train.py` (ver sección 4). Para este mini-TP se creó un bucket **nuevo y separado** (`datalake`), con sus propias zonas gestionadas directamente con `boto3`, en vez de reusar el bucket de MLflow. La razón: son responsabilidades distintas — `mlflow-artifacts` es un detalle de implementación interno de MLflow (su estructura de carpetas la define MLflow, no se gestiona a mano), mientras que `datalake` es la infraestructura de datos del proyecto en sí, con una estructura de zonas pensada y controlada explícitamente, independiente de qué herramienta de tracking se use.
+
+### 11.3. El mismo `boto3`, dos endpoints distintos
+
+`scripts/upload_to_datalake.py` y `src/tp_mlops2/datalake.py` usan `boto3.client("s3", endpoint_url=...)` de forma directa — el mismo patrón que ya se explicó en la sección 4.2 para MLflow, pero esta vez el código del proyecto lo controla explícitamente, no una librería de terceros por detrás. El punto central, que menciona la teoría del curso: este mismo código correría sin cambios contra Amazon S3 real — alcanza con cambiar el `endpoint_url` (y las credenciales) de MinIO local a un bucket de AWS. No hay nada en la lógica de subida/descarga atado a que el backend sea MinIO.
+
+### 11.4. Dos caminos independientes para cargar el modelo
+
+El proyecto ahora tiene dos formas distintas de llegar al mismo modelo:
+
+- **Vía MLflow** (`predict.load_model()`, usado por las tres APIs): resuelve el alias `production` en el Model Registry, que internamente sabe en qué artifact store (MinIO) y bajo qué ruta están los archivos, y los descarga a través de la API de MLflow.
+- **Vía Data Lake directo** (`datalake.load_model_from_lake()`): descarga `models/v1/model.joblib` del bucket `datalake` con `boto3` puro, sin que MLflow intervenga en absoluto.
+
+Ambos caminos, probados con el mismo caso de entrada, dieron exactamente la misma predicción (30694.1 MW) — confirma que son consistentes entre sí, aunque recorran infraestructura distinta para llegar al mismo resultado. El modelo que vive en `datalake/models/v1/` es una **copia** del que está en el registry de MLflow en el momento de la subida (`scripts/upload_to_datalake.py` lo baja de MLflow una vez y lo resube plano) — no se actualiza sola si se reentrena y se promueve una versión nueva; haría falta correr el script de nuevo para sincronizarla. Esa es una limitación real de tener dos fuentes de verdad en paralelo, aceptable para los fines de este mini-TP pero algo a resolver (automatizar la sincronización, o elegir un solo camino) en un sistema de producción real.
+
+### 11.5. La reflexión: ¿lake o imagen horneada?
+
+El enunciado pide justificar por qué servir el modelo desde el lake en vez de empaquetarlo dentro de la imagen Docker (es decir, un `COPY model.joblib` directo en el `Dockerfile`, el enfoque más simple posible).
+
+**A favor del lake:**
+- **No hace falta un rebuild de la imagen para desplegar un modelo nuevo.** Con el modelo horneado, cada reentrenamiento implicaría generar una imagen nueva y volver a desplegarla — acoplando el ciclo de vida del modelo al ciclo de vida del código de la aplicación, que son cosas que cambian a ritmos distintos (el modelo se reentrena cuando hay datos nuevos o el rendimiento decae; el código de la API cambia cuando se agrega una funcionalidad). Separarlos permite actualizar uno sin tocar el otro.
+- **La imagen queda genérica**, no atada a una versión específica de un artefacto pesado — la misma imagen puede servir cualquier versión del modelo según qué esté publicado en el lake/registry en ese momento.
+- **El historial de versiones queda en un lugar separado de las imágenes Docker**, facilitando auditar qué modelo estuvo activo en qué momento sin tener que rastrear tags o digests de imágenes.
+- **Separación de responsabilidades**: quien entrena y publica un modelo no necesita coordinar un despliegue de infraestructura para que esa versión entre en producción.
+
+**En contra:**
+- El arranque del contenedor es más lento (hay que descargar el modelo desde la red al iniciar — en este proyecto, del orden de 30 segundos la primera vez que se visto en los logs de los contenedores).
+- Agrega una dependencia externa en tiempo de arranque: si el almacenamiento (MinIO/S3) no está disponible en ese momento, el servicio no puede levantar — un modelo horneado en la imagen no tiene ese punto de falla adicional.
+
+La elección correcta depende del contexto: para un modelo que cambia con frecuencia y un equipo que separa el rol de quien entrena del de quien despliega, el lake es casi siempre la opción correcta pese al costo de arranque. Para un modelo que prácticamente no cambia, o un entorno donde minimizar dependencias externas es crítico (edge computing, por ejemplo), hornear el modelo puede ser la decisión más simple y robusta.
+
+## 12. CI/CD
 
 El workflow de GitHub Actions (`.github/workflows/ci.yml`) corre en cada push a `main`: instala dependencias con `uv`, corre el linter (`ruff check .`), y verifica que los módulos centrales del pipeline (`data`, `features`, `train`) se puedan importar sin errores.
 
 **Por qué no entrena ni levanta las APIs en el CI:** en una etapa temprana del proyecto, cuando el modelo se guardaba como archivos `.joblib` sueltos, el CI sí entrenaba un modelo en modo rápido y probaba la API end-to-end contra un servidor real. Al integrar MLflow, esto dejó de ser viable sin más trabajo: entrenar y servir el modelo ahora requieren Postgres, MinIO y MLflow corriendo, que el runner de GitHub Actions no tiene por defecto. Levantar todo ese stack dentro del CI (con sus healthchecks, creación de bucket, etc.) es una inversión de infraestructura considerable para el beneficio que aporta en esta etapa del proyecto — quedó documentado como decisión consciente, no como una limitación no notada. El CI actual es honesto sobre lo que garantiza: código bien formateado y sin errores triviales de import, no una corrida end-to-end del sistema completo.
 
-## 12. Decisiones de alcance y qué quedó afuera
+## 13. Decisiones de alcance y qué quedó afuera
 
 - **Orden de trabajo — infraestructura containerizada desde el principio, no al final:** se decidió explícitamente ir sumando cada pieza (MLflow, luego Neo4j, luego cada API, luego Redpanda) directamente como servicios de Docker Compose a medida que se armaban, en vez de resolver todo en local primero y containerizar recién al final. La ventaja de containerizar temprano es que el entorno final se prueba de entrada, en vez de descubrir problemas de containerización (como los de red interna descriptos en 5.3) recién al empaquetar un sistema ya grande.
 - **Adelantar tecnologías de clases posteriores:** Docker, MLflow, streaming, y el nivel de contenedores en general corresponden a clases más avanzadas del curso (MLflow se presenta formalmente en la Clase 2, Docker se profundiza en la Sesión 5, streaming es la Sesión 4) — se decidió avanzar con ellas de todos modos, conscientes de que un enfoque distinto presentado más adelante en el curso podría requerir ajustes.
 - **Airflow no se implementó todavía.** Es el orquestador que falta para completar el conjunto de herramientas que pide `CriteriosAprobacion.md` para el nivel contenedores (que exige explícitamente "un servicio de orquestación y algún servicio de ciclo de vida de modelos" — MLflow ya cubre lo segundo). Queda como próximo paso natural: un DAG que dispare `train.py` según un cronograma o disparador, en vez de correrlo a mano.
-- **El CI no cubre el sistema completo**, como se explica en la sección 11 — es una limitación conocida y documentada, no un descuido.
+- **El CI no cubre el sistema completo**, como se explica en la sección 12 — es una limitación conocida y documentada, no un descuido.
 - **El Mini-TP 5 (federado) es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
 - **El consumidor y los productores de streaming no están containerizados.** A diferencia de las tres APIs (procesos de servidor persistentes, con un ciclo de vida claro de "levantar y dejar corriendo"), el consumidor de Kafka es un proceso de larga vida pero los productores son scripts de una sola pasada — no tienen el mismo encaje natural en un `docker-compose.yml` pensado para servicios. Quedaron como scripts que se corren a mano con `uv run`, contra el broker Redpanda que sí está containerizado.
-- **El Hito TP #1 grupal** (equipo, roles, diagrama de arquitectura — mencionado en el enunciado de la Sesión 4) está fuera del alcance de este documento, que cubre el trabajo individual sobre el modelo de demanda eléctrica.
+- **La copia del modelo en el Data Lake no se sincroniza sola con el registry de MLflow**, como se explica en 11.4 — si se reentrena y se promueve una versión nueva a `production`, hay que volver a correr `scripts/upload_to_datalake.py` a mano para que la copia del lake quede al día. Es una limitación real de tener dos fuentes de verdad en paralelo, aceptada conscientemente para el alcance de este mini-TP.
+- **El Hito TP #1 grupal** (equipo, roles, diagrama de arquitectura — mencionado en el enunciado de la Sesión 4) y **el Hito TP #2** (checkpoint del integrador, mencionado en la Sesión 6) están fuera del alcance de este documento, que cubre el trabajo individual sobre el modelo de demanda eléctrica.

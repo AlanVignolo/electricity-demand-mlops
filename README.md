@@ -29,7 +29,7 @@ Copiar `.env.example` a `.env` y completar las credenciales.
 docker compose up -d --build
 ```
 
-Levanta 6 contenedores: `postgres` (guarda experimentos/métricas de MLflow), `minio` (guarda los modelos serializados, S3-compatible), `mlflow` (tracking + registry, puerto 5000), `neo4j` (grafo de linaje, 7474 consola / 7687 driver), `api` (REST, 8000) y `graphql-api` (8001).
+Levanta 9 contenedores: `postgres` (guarda experimentos/métricas de MLflow), `minio` (guarda los modelos serializados, S3-compatible), `mlflow` (tracking + registry, puerto 5000), `neo4j` (grafo de linaje, 7474 consola / 7687 driver), `api` (REST, 8000), `graphql-api` (8001), `grpc-api` (50051) y `redpanda` (broker de streaming, 9092).
 
 La primera vez hay que hacer 3 cosas a mano:
 1. Crear el bucket `mlflow-artifacts` en MinIO (`localhost:9001`).
@@ -126,6 +126,45 @@ gRPC dio bastante más rápido y más estable (la media de REST se aleja mucho d
 uv run python scripts/benchmark_latency.py
 ```
 
+## Streaming (Kafka/Redpanda)
+
+Simula un flujo de eventos y puntúa el modelo online, en vez de esperar un pedido puntual.
+
+```powershell
+uv run python -m tp_mlops2.streaming.consumer
+```
+
+Se suscribe al topic `demanda-eventos`, carga el modelo una sola vez (igual que las otras APIs) y va prediciendo evento por evento. Agrupa en ventanas de 20 eventos y por cada ventana completa calcula throughput, p95 de latencia, y un indicador de drift.
+
+```powershell
+uv run python scripts/stream_producer.py
+```
+
+Reconstruye el dataset limpio, toma el año 2018 (el mismo test set de siempre) y lo manda al topic de a un evento por vez, con un pequeño delay simulando que llega en tiempo real.
+
+**Drift:** la referencia es la media y el desvío de las predicciones logueadas en el run de MLflow activo (`mean_pred_mw`/`std_pred_mw`, agregadas a `train.py`); si el modelo activo no las tiene logueadas, usa la primera ventana del stream como referencia. Por ventana calcula un z-score: cuántos desvíos estándar se corre la media de esa ventana respecto a la referencia. Si supera el umbral (1.0), tira una alerta.
+
+Para ver la alerta disparar de verdad armé un segundo productor con un escenario exagerado — temperatura fija en 45°C en las 5 ciudades (`scripts/stream_producer_drift.py`), simulando una ola de calor extrema:
+
+```powershell
+uv run python scripts/stream_producer_drift.py
+```
+
+Acá encontré algo que no esperaba: el drift **no aparece parejo** a lo largo del stream. En las primeras ventanas (meses más fríos del año en el dataset), 45°C es un salto tan grande respecto a lo que el modelo vio en esa época que casi no reacciona — el Random Forest no extrapola bien fuera de la distribución que vio al entrenar. Recién en las ventanas que caen en meses donde temperaturas altas sí son algo que el modelo conoce, la predicción se dispara y ahí sí salta la alerta. Probé esto de forma aislada (misma fila, con y sin el salto de temperatura): en una muestra de enero el efecto es chico, unos +368 MW de diferencia promedio, contra +2600 MW en una fila de junio. Tiene sentido con lo que ya habíamos visto en el EDA: la demanda tiene una relación en U con la temperatura, no lineal, y el modelo aprendió esa forma solo donde tuvo datos para aprenderla.
+
+**Batch vs streaming**, mismas 500 filas de test 2018, prediciendo todas de una (`model.predict()` vectorizado) contra prediciendo de a una simulando el consumidor (`scripts/compare_batch_streaming.py`):
+
+```
+BATCH:      0.104s total | 4799 filas/s
+STREAMING:  29.321s total | 17 eventos/s (p95 72.8 ms)
+```
+
+Batch es como 280 veces más rápido en throughput total — tiene sentido, scikit-learn vectoriza la predicción de todo el lote en una sola llamada en vez de pagar el overhead de 500 llamadas sueltas. Pero esa no es la comparación justa para decidir cuál usar: en batch no tenés ninguna predicción hasta que termina todo el lote, en streaming tenés cada predicción lista casi al instante de que llega su evento. Si lo que importa es reaccionar rápido a un evento individual (alguien quiere saber la demanda prevista *ahora*, no al final del día), streaming gana aunque su throughput total sea mucho menor.
+
+```powershell
+uv run python scripts/compare_batch_streaming.py
+```
+
 ## Linaje (Neo4j)
 
 `scripts/seed_neo4j.py` lee el modelo activo de MLflow y arma el grafo: dataset crudo, dataset limpio, una feature por cada columna que usa el modelo, el experimento y el modelo, todo conectado. Se puede correr de nuevo sin duplicar nada.
@@ -138,19 +177,27 @@ uv run python scripts/seed_neo4j.py
 
 ```
 tp_mlops2/
-├── data/                 # raw/ y processed/, no versionados
-├── notebooks/             # EDA, no es código de producción
-├── scripts/seed_neo4j.py
+├── data/                        # raw/ y processed/, no versionados
+├── notebooks/                    # EDA, no es código de producción
+├── scripts/
+│   ├── seed_neo4j.py
+│   ├── benchmark_latency.py      # gRPC vs REST
+│   ├── stream_producer.py        # productor normal
+│   ├── stream_producer_drift.py  # productor con temperatura fija, para probar la alerta
+│   └── compare_batch_streaming.py
+├── scoring.proto                 # contrato gRPC
 ├── src/tp_mlops2/
-│   ├── data.py            # limpieza
-│   ├── features.py        # cíclicas + lags
-│   ├── train.py           # tuning + logging a MLflow
-│   ├── predict.py         # carga el modelo desde el registry
-│   ├── api/                # REST
-│   └── graphql_api/        # GraphQL
+│   ├── data.py                   # limpieza
+│   ├── features.py               # cíclicas + lags
+│   ├── train.py                  # tuning + logging a MLflow
+│   ├── predict.py                # carga el modelo desde el registry
+│   ├── api/                       # REST
+│   ├── graphql_api/               # GraphQL
+│   ├── grpc_api/                  # gRPC (server, client, stubs generados)
+│   └── streaming/consumer.py      # consumidor Kafka/Redpanda
 ├── tests/test_cliente.py
 ├── docker-compose.yml
-└── Dockerfile.api / Dockerfile.mlflow / Dockerfile.graphql
+└── Dockerfile.api / Dockerfile.mlflow / Dockerfile.graphql / Dockerfile.grpc
 ```
 
 El pipeline (`data.py` → `features.py` → `train.py`/`predict.py`) no depende de los notebooks para nada — esos quedaron solo para el análisis exploratorio.

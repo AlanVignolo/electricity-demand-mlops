@@ -89,7 +89,10 @@ def train_model(data_dir: Path, quick: bool = False) -> None:
             "mae_mw": mean_absolute_error(y_test, y_pred),
             "mape": mean_absolute_percentage_error(y_test, y_pred),
             "rmse_mw": root_mean_squared_error(y_test, y_pred),
+            "mean_pred_mw": float(y_pred.mean()),
+            "std_pred_mw": float(y_pred.std()),
         }
+
 
         mlflow.log_params(search.best_params_)
         mlflow.log_param("quick_mode", quick)

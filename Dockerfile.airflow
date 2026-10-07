@@ -1,0 +1,21 @@
+FROM apache/airflow:2.10.4-python3.12
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends gcc python3-venv && apt-get clean
+
+USER airflow
+WORKDIR /opt/airflow
+
+COPY --chown=airflow:root pyproject.toml uv.lock README.md ./
+COPY --chown=airflow:root src/ ./src/
+
+# venv del entorno de Airflow: solo lo que usa upload_to_datalake.py (sin mlflow)
+RUN pip install --no-cache-dir -e . --no-deps
+RUN pip install --no-cache-dir boto3 python-dotenv scikit-learn pandas numpy joblib pyyaml requests
+
+# venv aislado para correr train.py: aqui si entra mlflow con su propio cryptography,
+# sin pisar la version que necesitan los providers de Airflow
+RUN python3 -m venv /opt/airflow/venv-ml
+RUN /opt/airflow/venv-ml/bin/pip install --no-cache-dir -e . --no-deps
+RUN /opt/airflow/venv-ml/bin/pip install --no-cache-dir \
+    mlflow==3.16.0 boto3 python-dotenv scikit-learn pandas numpy joblib

@@ -29,7 +29,7 @@ PARAM_DIST_RF = {
     "min_samples_leaf": [1, 2, 5, 10],
     "max_features": ["sqrt", 0.5, 0.8, 1.0],
 }
-MLFLOW_TRACKING_URI = "http://localhost:5000"
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MLFLOW_EXPERIMENT_NAME = "demanda-electrica-espana"
 REGISTERED_MODEL_NAME = "random_forest_demanda"
 
@@ -101,8 +101,10 @@ def train_model(data_dir: Path, quick: bool = False) -> None:
         mlflow.sklearn.log_model(
             best_model,
             artifact_path="model",
-            registered_model_name=REGISTERED_MODEL_NAME
+            registered_model_name=REGISTERED_MODEL_NAME,
+            serialization_format="cloudpickle",
         )
+
 
         print("Mejores parámetros:", search.best_params_)
         print(

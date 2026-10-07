@@ -5,7 +5,7 @@ import boto3
 import joblib
 from dotenv import load_dotenv
 
-from tp_mlops2.predict import load_model
+from tp_mlops2.predict import load_model_lightweight
 
 load_dotenv()
 
@@ -40,7 +40,7 @@ def upload_curated_zone(s3):
 
 
 def upload_models_zone(s3):
-    model, feature_cols, metrics = load_model()
+    model, feature_cols, metrics = load_model_lightweight(s3)
 
     local_tmp = Path("model_tmp.joblib")
     joblib.dump(model, local_tmp)

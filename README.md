@@ -29,7 +29,7 @@ Copiar `.env.example` a `.env` y completar las credenciales.
 docker compose up -d --build
 ```
 
-Levanta 9 contenedores: `postgres` (guarda experimentos/métricas de MLflow), `minio` (guarda los modelos serializados, S3-compatible), `mlflow` (tracking + registry, puerto 5000), `neo4j` (grafo de linaje, 7474 consola / 7687 driver), `api` (REST, 8000), `graphql-api` (8001), `grpc-api` (50051) y `redpanda` (broker de streaming, 9092).
+Levanta 12 contenedores: `postgres` (guarda experimentos/métricas de MLflow), `minio` (guarda los modelos serializados, S3-compatible), `mlflow` (tracking + registry, puerto 5000), `neo4j` (grafo de linaje, 7474 consola / 7687 driver), `api` (REST, 8000), `graphql-api` (8001), `grpc-api` (50051), `redpanda` (broker de streaming, 9092), `postgres-airflow` (backend store de Airflow, separado del de MLflow), `airflow-init` (setup, corre una vez y termina), `airflow-webserver` (UI, 8080) y `airflow-scheduler`.
 
 La primera vez hay que hacer 3 cosas a mano:
 1. Crear el bucket `mlflow-artifacts` en MinIO (`localhost:9001`).
@@ -224,31 +224,55 @@ Lo que pierdo: el arranque es más lento (el contenedor tiene que bajar el model
 uv run python scripts/seed_neo4j.py
 ```
 
+## Orquestación (Airflow)
+
+Un DAG (`train_demanda_electrica`, `dags/train_demanda_electrica.py`) reentrena el modelo y publica la versión nueva en el Data Lake, en vez de correr `train.py` y `upload_to_datalake.py` a mano cada vez. Dos tareas: `train_model` >> `upload_to_datalake`. Programado `@weekly`, pero se puede disparar manual desde la UI.
+
+UI en `localhost:8080` (usuario/contraseña: `admin`/`admin`, creados por el contenedor `airflow-init` la primera vez que se levanta el stack).
+
+**Por qué el DAG no usa `PythonOperator` importando `train_model` directo:** `mlflow` (en cualquier versión que use features recientes de pandas/pyarrow) no es instalable en el mismo entorno que los providers de Airflow 2.10.4 sin pisar la versión de `cryptography` que esos providers necesitan — son dos requerimientos de versión que no se superponen (más detalle en DECISIONES.md). La solución: la imagen de Airflow trae un **segundo virtualenv aislado** (`/opt/airflow/venv-ml`) con `mlflow` instalado ahí adentro, separado del venv principal donde corre Airflow. El DAG lanza `train.py` como subproceso usando el Python de ese venv aislado:
+
+```python
+subprocess.run(["/opt/airflow/venv-ml/bin/python", "-m", "tp_mlops2.train"], cwd="/opt/airflow", ...)
+```
+
+`upload_to_datalake.py`, en cambio, corre con el Python normal de Airflow — ya no necesita `mlflow` para nada, porque `predict.py` ganó una función (`load_model_lightweight`) que resuelve el modelo activo vía la REST API de MLflow y lo descarga directo de MinIO con `boto3` + `pickle`, sin pasar por el SDK completo.
+
+```powershell
+docker compose build airflow-webserver airflow-scheduler airflow-init
+docker compose up -d --force-recreate airflow-init airflow-webserver airflow-scheduler
+```
+
+Para disparar el DAG a mano: UI → `train_demanda_electrica` → ▶ Trigger DAG. Las dos tareas deberían quedar en verde; `upload_to_datalake` sube la versión recién entrenada a `datalake/models/v1/`, pisando la anterior.
+
 ## Estructura
 
 ```
 tp_mlops2/
 ├── data/                        # raw/ y processed/, no versionados
 ├── notebooks/                    # EDA, no es código de producción
+├── dags/
+│   └── train_demanda_electrica.py  # DAG de Airflow: train_model >> upload_to_datalake
 ├── scripts/
 │   ├── seed_neo4j.py
 │   ├── benchmark_latency.py      # gRPC vs REST
 │   ├── stream_producer.py        # productor normal
 │   ├── stream_producer_drift.py  # productor con temperatura fija, para probar la alerta
-│   └── compare_batch_streaming.py
+│   ├── compare_batch_streaming.py
+│   └── upload_to_datalake.py     # también la corre Airflow, vía subprocess
 ├── scoring.proto                 # contrato gRPC
 ├── src/tp_mlops2/
 │   ├── data.py                   # limpieza
 │   ├── features.py               # cíclicas + lags
 │   ├── train.py                  # tuning + logging a MLflow
-│   ├── predict.py                # carga el modelo desde el registry
+│   ├── predict.py                # carga el modelo (desde el registry, o liviana sin mlflow)
 │   ├── api/                       # REST
 │   ├── graphql_api/               # GraphQL
 │   ├── grpc_api/                  # gRPC (server, client, stubs generados)
 │   └── streaming/consumer.py      # consumidor Kafka/Redpanda
 ├── tests/test_cliente.py
 ├── docker-compose.yml
-└── Dockerfile.api / Dockerfile.mlflow / Dockerfile.graphql / Dockerfile.grpc
+└── Dockerfile.api / Dockerfile.mlflow / Dockerfile.graphql / Dockerfile.grpc / Dockerfile.airflow
 ```
 
 El pipeline (`data.py` → `features.py` → `train.py`/`predict.py`) no depende de los notebooks para nada — esos quedaron solo para el análisis exploratorio.

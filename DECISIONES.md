@@ -15,8 +15,9 @@ Este documento explica la teoría detrás de cada parte del proyecto, por qué s
 9. [Mini-TP 4: streaming con Kafka/Redpanda](#9-mini-tp-4-streaming-con-kafkaredpanda)
 10. [Mini-TP 5: aprendizaje federado](#10-mini-tp-5-aprendizaje-federado)
 11. [Mini-TP 6: Data Lake](#11-mini-tp-6-data-lake)
-12. [CI/CD](#12-cicd)
-13. [Decisiones de alcance y qué quedó afuera](#13-decisiones-de-alcance-y-qué-quedó-afuera)
+12. [Airflow: orquestación](#12-airflow-orquestación)
+13. [CI/CD](#13-cicd)
+14. [Decisiones de alcance y qué quedó afuera](#14-decisiones-de-alcance-y-qué-quedó-afuera)
 
 ---
 
@@ -336,18 +337,55 @@ El enunciado pide justificar por qué servir el modelo desde el lake en vez de e
 
 La elección correcta depende del contexto: para un modelo que cambia con frecuencia y un equipo que separa el rol de quien entrena del de quien despliega, el lake es casi siempre la opción correcta pese al costo de arranque. Para un modelo que prácticamente no cambia, o un entorno donde minimizar dependencias externas es crítico (edge computing, por ejemplo), hornear el modelo puede ser la decisión más simple y robusta.
 
-## 12. CI/CD
+## 12. Airflow: orquestación
+
+### 12.1. Qué problema resuelve Airflow que el resto del proyecto no
+
+Hasta este punto, reentrenar el modelo y actualizar el Data Lake eran dos pasos manuales: correr `train.py`, ir a la UI de MLflow a mover el alias `production`, y correr `upload_to_datalake.py`. Eso funciona para desarrollo, pero no es lo que se espera de un sistema en producción: el reentrenamiento tiene que poder dispararse solo, con un cronograma, con reintentos si algo falla, y con un registro de qué corrió y cuándo. Airflow es un orquestador de workflows: se define un **DAG** (grafo acíclico dirigido) de tareas con dependencias entre sí, y Airflow se encarga de programarlo, ejecutarlo, reintentarlo y loguearlo.
+
+El DAG de este proyecto (`dags/train_demanda_electrica.py`) tiene dos tareas: `train_model` y `upload_to_datalake`, con una dependencia simple (`train_model >> upload_to_datalake` — la segunda no arranca hasta que la primera termina bien). Programado `@weekly`, aunque también se puede disparar a mano desde la UI.
+
+### 12.2. El conflicto real: mlflow no puede convivir con Airflow en el mismo entorno Python
+
+Esto fue el problema central de integrar esta pieza, y vale la pena documentarlo porque no es un bug puntual sino una incompatibilidad estructural entre dos librerías con requisitos de versión que no se superponen.
+
+Airflow 2.10.4 publica un archivo de *constraints* oficial que fija las versiones exactas de todas sus dependencias (incluyendo las de sus providers) para garantizar que el entorno completo sea instalable sin conflictos — ese archivo fija `cryptography==42.0.8`. Por otro lado, toda la serie 3.x de `mlflow` (incluida la versión 3.16.0 usada en el resto del proyecto) fija a su vez `pandas<3` y `pyarrow<22` como techo, y a partir de la versión 3.3.0 exige `cryptography>=43.0.0` como piso. No existe ninguna versión de `mlflow` que acepte a la vez `cryptography==42.0.8` (lo que pide Airflow) y las versiones modernas de `pandas`/`pyarrow` que usa el resto de este proyecto (`pandas>=3.0.5`, necesarias para el resto del pipeline) — son dos pisos de requisitos que, confirmado consultando directamente los metadatos de PyPI de cada versión, nunca se cruzan en un punto común.
+
+Se descartaron dos salidas antes de llegar a la solución final: bajar `mlflow` del proyecto entero a la versión 3.2.0 (la única sin ese piso de `cryptography`) hubiese forzado un downgrade en cadena de `pandas`/`pyarrow`/`numpy` en TODO el proyecto, no solo en Airflow — demasiado invasivo para resolver un problema que en realidad es solo de un contenedor. Forzar `cryptography>=43` dentro de la imagen de Airflow (para poder instalar `mlflow` ahí) rompía a su vez los providers propios de Airflow, que dependen de `pyOpenSSL`, el cual a su vez depende de una versión de `cryptography` específica — mover una pieza rompía la otra.
+
+### 12.3. La solución: dos virtualenvs dentro de la misma imagen, y sacar mlflow de donde no hace falta
+
+La solución tiene dos partes, cada una resolviendo una mitad del problema:
+
+**Para `train_model` (sí necesita el SDK completo de mlflow):** la imagen de Airflow (`Dockerfile.airflow`) crea un **segundo virtualenv aislado** dentro de sí misma, en `/opt/airflow/venv-ml`, completamente separado del venv principal donde corre Airflow. Ahí adentro se instala `mlflow==3.16.0` con su propio `cryptography>=43`, sin que eso toque para nada la versión que necesitan los providers de Airflow en el venv principal — son dos árboles de dependencias que coexisten en la misma imagen sin pisarse, porque viven en directorios de instalación distintos. El DAG ya no importa `train_model` directo con un `PythonOperator` normal (eso cargaría `mlflow` dentro del propio proceso de Airflow, reabriendo el conflicto) — en cambio, lanza `train.py` como un **subproceso** que usa explícitamente el intérprete Python de ese venv aislado:
+
+```python
+subprocess.run(["/opt/airflow/venv-ml/bin/python", "-m", "tp_mlops2.train"], cwd="/opt/airflow", ...)
+```
+
+**Para `upload_to_datalake` (en realidad no necesita el SDK completo, solo necesita *leer* el modelo activo):** en vez de replicar el mismo truco del venv aislado para esta segunda tarea, se eliminó la dependencia de raíz. `predict.py` ganó una función nueva, `load_model_lightweight(s3_client)`, que resuelve el modelo en producción **sin** el paquete `mlflow` instalado: le pega directo a la REST API de MLflow (`GET /api/2.0/mlflow/registered-models/alias` para resolver el alias `production` a un `model_id` concreto, `GET /api/2.0/mlflow/runs/get` para las métricas) usando solamente `requests`, y después descarga el archivo serializado directo del bucket `mlflow-artifacts` en MinIO con `boto3`, leyendo primero el `MLmodel` (un YAML que loguea el propio MLflow junto al modelo) para saber el nombre exacto del archivo — y lo deserializa con `pickle.load()` puro, sin ninguna dependencia de mlflow en el proceso que lo ejecuta. Fue necesario además forzar `serialization_format="cloudpickle"` en `mlflow.sklearn.log_model()` (dentro de `train.py`): sin esto, mlflow serializa por defecto en un formato propio (`skops`) que ni siquiera versiones más viejas de mlflow saben leer — forzar el formato estándar de Python es lo que permite que `pickle.load()` puro funcione del otro lado, sin ningún SDK de por medio.
+
+Con esto, el venv **principal** de Airflow (el que corre `upload_to_datalake.py` sin subproceso) nunca necesita instalar `mlflow` — solo `boto3`, `requests`, `pyyaml`, y las librerías de cómputo (`pandas`, `numpy`, `scikit-learn`, `joblib`) que ya necesitaba de todos modos para deserializar el modelo y escribir los artefactos del Data Lake.
+
+### 12.4. Por qué esto es mejor que simplemente "forzar que ande" con un pin frágil
+
+Una alternativa más rápida hubiese sido fijar manualmente alguna combinación de versiones que casualmente no colisionara en el momento de escribir este documento (por ejemplo, pineando `cryptography` a un valor intermedio con la esperanza de que ambas librerías lo tolerasen). Se descartó porque sería un acuerdo frágil y accidental, no una garantía: cualquier actualización futura de cualquiera de las dos librerías podría volver a romperlo sin aviso, y el pin no explicaría *por qué* esa versión funciona. La solución de los dos entornos aislados, en cambio, es estructural — Airflow y mlflow nunca comparten un árbol de dependencias, así que no hay pin que mantener ni versión mágica que recordar; cada uno vive en su propio virtualenv con las versiones que realmente necesita.
+
+### 12.5. Validación end-to-end
+
+Con el DAG completo disparado desde la UI, ambas tareas (`train_model`, `upload_to_datalake`) terminan en éxito: el entrenamiento corre dentro del venv aislado (con mlflow completo), registra la nueva versión en MLflow, y la segunda tarea la descarga con el camino liviano (sin mlflow) y la sube al Data Lake. Se verificó además que el modelo resultante en `datalake/models/v1/model.joblib` se puede cargar correctamente (es un `RandomForestRegressor` con las 14 features esperadas) — confirmando que el pipeline de reentrenamiento automatizado es funcional de punta a punta, no solo que las tareas terminan sin error.
+
+## 13. CI/CD
 
 El workflow de GitHub Actions (`.github/workflows/ci.yml`) corre en cada push a `main`: instala dependencias con `uv`, corre el linter (`ruff check .`), y verifica que los módulos centrales del pipeline (`data`, `features`, `train`) se puedan importar sin errores.
 
 **Por qué no entrena ni levanta las APIs en el CI:** en una etapa temprana del proyecto, cuando el modelo se guardaba como archivos `.joblib` sueltos, el CI sí entrenaba un modelo en modo rápido y probaba la API end-to-end contra un servidor real. Al integrar MLflow, esto dejó de ser viable sin más trabajo: entrenar y servir el modelo ahora requieren Postgres, MinIO y MLflow corriendo, que el runner de GitHub Actions no tiene por defecto. Levantar todo ese stack dentro del CI (con sus healthchecks, creación de bucket, etc.) es una inversión de infraestructura considerable para el beneficio que aporta en esta etapa del proyecto — quedó documentado como decisión consciente, no como una limitación no notada. El CI actual es honesto sobre lo que garantiza: código bien formateado y sin errores triviales de import, no una corrida end-to-end del sistema completo.
 
-## 13. Decisiones de alcance y qué quedó afuera
+## 14. Decisiones de alcance y qué quedó afuera
 
-- **Orden de trabajo — infraestructura containerizada desde el principio, no al final:** se decidió explícitamente ir sumando cada pieza (MLflow, luego Neo4j, luego cada API, luego Redpanda) directamente como servicios de Docker Compose a medida que se armaban, en vez de resolver todo en local primero y containerizar recién al final. La ventaja de containerizar temprano es que el entorno final se prueba de entrada, en vez de descubrir problemas de containerización (como los de red interna descriptos en 5.3) recién al empaquetar un sistema ya grande.
+- **Orden de trabajo — infraestructura containerizada desde el principio, no al final:** se decidió explícitamente ir sumando cada pieza (MLflow, luego Neo4j, luego cada API, luego Redpanda, luego Airflow) directamente como servicios de Docker Compose a medida que se armaban, en vez de resolver todo en local primero y containerizar recién al final. La ventaja de containerizar temprano es que el entorno final se prueba de entrada, en vez de descubrir problemas de containerización (como los de red interna descriptos en 5.3, o el conflicto de dependencias de Airflow descripto en 12.2) recién al empaquetar un sistema ya grande.
 - **Adelantar tecnologías de clases posteriores:** Docker, MLflow, streaming, y el nivel de contenedores en general corresponden a clases más avanzadas del curso (MLflow se presenta formalmente en la Clase 2, Docker se profundiza en la Sesión 5, streaming es la Sesión 4) — se decidió avanzar con ellas de todos modos, conscientes de que un enfoque distinto presentado más adelante en el curso podría requerir ajustes.
-- **Airflow no se implementó todavía.** Es el orquestador que falta para completar el conjunto de herramientas que pide `CriteriosAprobacion.md` para el nivel contenedores (que exige explícitamente "un servicio de orquestación y algún servicio de ciclo de vida de modelos" — MLflow ya cubre lo segundo). Queda como próximo paso natural: un DAG que dispare `train.py` según un cronograma o disparador, en vez de correrlo a mano.
-- **El CI no cubre el sistema completo**, como se explica en la sección 12 — es una limitación conocida y documentada, no un descuido.
+- **El CI no cubre el sistema completo**, como se explica en la sección 13 — es una limitación conocida y documentada, no un descuido.
 - **El Mini-TP 5 (federado) es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
 - **El consumidor y los productores de streaming no están containerizados.** A diferencia de las tres APIs (procesos de servidor persistentes, con un ciclo de vida claro de "levantar y dejar corriendo"), el consumidor de Kafka es un proceso de larga vida pero los productores son scripts de una sola pasada — no tienen el mismo encaje natural en un `docker-compose.yml` pensado para servicios. Quedaron como scripts que se corren a mano con `uv run`, contra el broker Redpanda que sí está containerizado.
 - **La copia del modelo en el Data Lake no se sincroniza sola con el registry de MLflow**, como se explica en 11.4 — si se reentrena y se promueve una versión nueva a `production`, hay que volver a correr `scripts/upload_to_datalake.py` a mano para que la copia del lake quede al día. Es una limitación real de tener dos fuentes de verdad en paralelo, aceptada conscientemente para el alcance de este mini-TP.

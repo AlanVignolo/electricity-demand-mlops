@@ -2,7 +2,7 @@
 
 TP integrador de Operaciones de Aprendizaje de Máquina II (CEIA/FIUBA). La idea es predecir la demanda eléctrica horaria de España (`total load actual`) con el dataset de Kaggle [energy-consumption-generation-prices-and-weather](https://www.kaggle.com/datasets/nicholasjhana/energy-consumption-generation-prices-and-weather): consumo, generación, precios y clima de las 5 ciudades más grandes del país, 2015-2018.
 
-Voy por el nivel contenedores del TP: todo corre en Docker Compose (Postgres, MinIO, MLflow, Neo4j, y dos APIs — REST y GraphQL). Lo fui armando de a poco, mini-TP por mini-TP, según el orden del curso.
+Voy por el nivel contenedores del TP: el mismo modelo se sirve por REST, GraphQL y gRPC, se integra a streaming y a aprendizaje federado, vive en un Data Lake propio, se orquesta con Airflow, y todo corre en Docker Compose. Lo fui armando de a poco, capa por capa, siguiendo el orden del curso, pero pensado como un solo sistema integrado, no como ejercicios sueltos.
 
 ## Setup local (sin Docker)
 
@@ -245,12 +245,27 @@ docker compose up -d --force-recreate airflow-init airflow-webserver airflow-sch
 
 Para disparar el DAG a mano: UI → `train_demanda_electrica` → ▶ Trigger DAG. Las dos tareas deberían quedar en verde; `upload_to_datalake` sube la versión recién entrenada a `datalake/models/v1/`, pisando la anterior.
 
+## Seguridad (SAIF)
+
+Cada capa de serving/integración tiene su propio notebook de seguridad (`notebooks/07` a `12`), siguiendo el marco **SAIF** (Secure AI Framework): se muestra primero cómo está servida la capa hoy (sin controles), después se aplica el control principal sobre el código y el modelo reales del proyecto (no sobre datos de juguete), y se cierra con una reflexión sobre qué amenaza se mitiga y a qué elemento de SAIF corresponde.
+
+| Notebook | Capa | Controles |
+|---|---|---|
+| `07_security_rest.ipynb` | REST | API key + JWT por rol + rate limiting + auditoría |
+| `08_security_graphql.ipynb` | GraphQL | introspección desactivada + límite de profundidad + autorización por campo |
+| `09_security_grpc.ipynb` | gRPC | interceptor JWT en metadata + límite de tamaño de mensaje + TLS (conceptual) |
+| `10_security_streaming.ipynb` | Streaming | validación de esquema + cuarentena (DLQ) + firma HMAC del productor |
+| `11_security_federated.ipynb` | Federado | agregación robusta (mediana) + *clipping* + privacidad diferencial, contra un cliente malicioso real |
+| `12_security_datalake.ipynb` | Data Lake | checksum de integridad + URLs prefirmadas + política de acceso mínimo por zona |
+
+Dos resultados que vale la pena destacar porque son medidos, no supuestos: en gRPC, el servidor real sin autenticar responde sin problema (nadie lo frena); con el interceptor de JWT, una llamada sin token o con token vencido devuelve `UNAUTHENTICATED`. En federado, un único cliente malicioso con un update invertido colapsa FedAvg con promedio simple a accuracy **0.000**; con agregación por mediana (+ *clipping* + ruido para privacidad diferencial), el modelo global se mantiene en **0.93**.
+
 ## Estructura
 
 ```
 tp_mlops2/
 ├── data/                        # raw/ y processed/, no versionados
-├── notebooks/                    # EDA, no es código de producción
+├── notebooks/                    # EDA (01-06) + seguridad por capa (07-12)
 ├── dags/
 │   └── train_demanda_electrica.py  # DAG de Airflow: train_model >> upload_to_datalake
 ├── scripts/

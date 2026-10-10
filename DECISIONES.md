@@ -9,15 +9,16 @@ Este documento explica la teoría detrás de cada parte del proyecto, por qué s
 3. [De notebooks a código reproducible](#3-de-notebooks-a-código-reproducible)
 4. [MLflow: tracking y model registry](#4-mlflow-tracking-y-model-registry)
 5. [Docker y Docker Compose](#5-docker-y-docker-compose)
-6. [Mini-TP 1: API REST](#6-mini-tp-1-api-rest)
-7. [Mini-TP 2: API GraphQL y linaje con Neo4j](#7-mini-tp-2-api-graphql-y-linaje-con-neo4j)
-8. [Mini-TP 3: API gRPC](#8-mini-tp-3-api-grpc)
-9. [Mini-TP 4: streaming con Kafka/Redpanda](#9-mini-tp-4-streaming-con-kafkaredpanda)
-10. [Mini-TP 5: aprendizaje federado](#10-mini-tp-5-aprendizaje-federado)
-11. [Mini-TP 6: Data Lake](#11-mini-tp-6-data-lake)
+6. [API REST](#6-api-rest)
+7. [API GraphQL y linaje con Neo4j](#7-api-graphql-y-linaje-con-neo4j)
+8. [API gRPC](#8-api-grpc)
+9. [Streaming con Kafka/Redpanda](#9-streaming-con-kafkaredpanda)
+10. [Aprendizaje federado](#10-aprendizaje-federado)
+11. [Data Lake](#11-data-lake)
 12. [Airflow: orquestación](#12-airflow-orquestación)
 13. [CI/CD](#13-cicd)
-14. [Decisiones de alcance y qué quedó afuera](#14-decisiones-de-alcance-y-qué-quedó-afuera)
+14. [Seguridad y gobernanza (SAIF)](#14-seguridad-y-gobernanza-saif)
+15. [Decisiones de alcance y qué quedó afuera](#15-decisiones-de-alcance-y-qué-quedó-afuera)
 
 ---
 
@@ -126,7 +127,7 @@ Un contenedor puede reportarse como "iniciado" (`Started`) mucho antes de estar 
 
 Al conectar la API (corriendo en su propio contenedor) contra MLflow usando el nombre de servicio (`http://mlflow:5000`), MLflow rechazaba la conexión con `403 Invalid Host header - possible DNS rebinding attack detected`. Esta es una protección de seguridad de versiones recientes del servidor de MLflow: por defecto, solo confía en pedidos cuyo header `Host` sea `localhost` o `127.0.0.1`, para evitar un tipo de ataque donde un sitio malicioso hace que el navegador de una víctima le pegue a un servicio interno creyendo que es un dominio externo. Como en este caso `mlflow` es un nombre de host legítimo (el propio servicio Docker), la solución fue declarar explícitamente qué hosts son confiables con la variable `MLFLOW_SERVER_ALLOWED_HOSTS`, incluyendo tanto el nombre sin puerto como con puerto (`mlflow`, `mlflow:5000`) — el chequeo compara el header completo, así que faltaba la variante con puerto explícito en un primer intento.
 
-## 6. Mini-TP 1: API REST
+## 6. API REST
 
 ### 6.1. Por qué FastAPI
 
@@ -140,7 +141,7 @@ Se decidió que `/v1/predict` reciba **datos crudos** (timestamp, temperaturas d
 
 El endpoint es `/v1/predict` (con el prefijo de versión) en vez de `/predict` a secas, y la respuesta incluye `model_version` — ambos son parte del contrato pedido: un cliente de la API no solo necesita el número, necesita saber con qué versión del modelo se generó, algo relevante si conviven varias versiones o si hace falta reproducir un resultado más adelante.
 
-## 7. Mini-TP 2: API GraphQL y linaje con Neo4j
+## 7. API GraphQL y linaje con Neo4j
 
 ### 7.1. Qué resuelve GraphQL que REST no
 
@@ -164,7 +165,7 @@ El script es **idempotente** (usa `MERGE` en vez de `CREATE`, y borra todo al pr
 
 Documentadas en el README, resumidas acá: GraphQL responde casi siempre con `200 OK` incluso cuando hay errores de lógica (los errores viajan dentro del JSON, en una clave `errors`, no en el código HTTP) — esto es una diferencia de diseño real que hay que tener en cuenta al programar un cliente. A cambio de la flexibilidad, GraphQL exige que el cliente sepa construir una consulta válida, mientras que REST es más directo de invocar con una sola URL.
 
-## 8. Mini-TP 3: API gRPC
+## 8. API gRPC
 
 ### 8.1. Qué problema resuelve gRPC
 
@@ -200,7 +201,7 @@ gRPC resultó considerablemente más rápido y, sobre todo, más **consistente**
 
 La contrapartida, no capturada en el número pero relevante para la decisión de cuándo usar cada uno: gRPC pierde la inspeccionabilidad fácil de REST (no se puede probar con `curl` a mano ni explorar con un navegador, como sí se puede con Swagger o GraphiQL), y requiere generar y mantener stubs cada vez que cambia el contrato.
 
-## 9. Mini-TP 4: streaming con Kafka/Redpanda
+## 9. Streaming con Kafka/Redpanda
 
 ### 9.1. Qué problema resuelve streaming que las tres APIs anteriores no
 
@@ -218,14 +219,14 @@ Se usó **Redpanda** en vez de un Kafka real: habla exactamente el mismo protoco
 - **Broker** (Redpanda): recibe y retiene los eventos.
 - **Consumidor** (`src/tp_mlops2/streaming/consumer.py`): se suscribe al topic, carga el modelo una sola vez al arrancar (mismo patrón que las tres APIs anteriores — nunca recargar el modelo por evento), y predice cada evento a medida que llega.
 
-Una simplificación consciente en el productor: los lags de demanda (`load_lag_24h`, `load_lag_168h`) que en el pipeline de entrenamiento se calculan con un `.shift()` sobre toda la serie histórica, acá se aproximan tomando la demanda real de la fila actual. Reconstruir el lag verdadero dentro de un evento de streaming requeriría consultar un almacén de features en tiempo real (un "feature store" online) con el historial reciente — una pieza de infraestructura más, fuera del alcance razonable de este mini-TP.
+Una simplificación consciente en el productor: los lags de demanda (`load_lag_24h`, `load_lag_168h`) que en el pipeline de entrenamiento se calculan con un `.shift()` sobre toda la serie histórica, acá se aproximan tomando la demanda real de la fila actual. Reconstruir el lag verdadero dentro de un evento de streaming requeriría consultar un almacén de features en tiempo real (un "feature store" online) con el historial reciente — una pieza de infraestructura más, fuera del alcance razonable de esta capa.
 
 ### 9.4. Métricas por ventana: throughput, p95, drift
 
 En vez de reportar una métrica por cada evento individual (ruidoso, difícil de leer), el consumidor agrupa en **ventanas** de 20 eventos (ventana por cantidad fija de eventos, no por tiempo — más simple de implementar y de razonar que una ventana tumbling por reloj) y por cada ventana completa calcula:
 
 - **Throughput**: eventos procesados por segundo en esa ventana.
-- **p95 de latencia**: el tiempo de predicción (desde que llega el evento hasta que hay una predicción) por debajo del cual cae el 95% de los eventos de la ventana — igual que se usó en el benchmark de latencia del mini-TP 3, pero calculado en vivo, ventana por ventana.
+- **p95 de latencia**: el tiempo de predicción (desde que llega el evento hasta que hay una predicción) por debajo del cual cae el 95% de los eventos de la ventana — igual que se usó en el benchmark de latencia de la sección de gRPC, pero calculado en vivo, ventana por ventana.
 - **Drift**: un z-score — cuántos desvíos estándar se aleja la media de las predicciones de esa ventana respecto de una referencia.
 
 ### 9.5. La referencia de drift y por qué tiene un mecanismo de respaldo
@@ -255,9 +256,9 @@ Batch resultó **~280 veces más rápido en throughput total**. La razón es est
 
 Pero ese número no responde la pregunta de cuál conviene — responde solo "cuál mueve más volumen en menos tiempo total". La pregunta que importa en un sistema real es otra: ¿cuánto tardo en tener *una* predicción lista desde que *ese* dato puntual está disponible? En batch, ninguna predicción está lista hasta que el lote completo terminó de procesarse — si el lote se arma una vez por hora, la predicción más temprana del lote espera hasta una hora para estar disponible. En streaming, cada predicción está lista casi al instante de que llega su evento (en este caso, en el orden de los 50-70ms medidos). Streaming sacrifica throughput agregado a cambio de latencia de respuesta por evento individual — la elección correcta depende de si el caso de uso necesita "la predicción de este evento, ya" o "las predicciones de este lote, en algún momento cercano".
 
-## 10. Mini-TP 5: aprendizaje federado
+## 10. Aprendizaje federado
 
-### 10.1. Por qué este mini-TP no usa el modelo de demanda eléctrica
+### 10.1. Por qué esta capa no usa el modelo de demanda eléctrica
 
 Aprendizaje federado (FedAvg) funciona promediando los **parámetros** de un modelo paramétrico — pesos de una red neuronal, de una regresión, de un clasificador lineal. Un Random Forest no tiene un conjunto fijo de parámetros que se puedan promediar de esa forma (cada árbol es una estructura discreta distinta, entrenada con splits propios) — "promediar" dos Random Forest no tiene un equivalente directo y natural al promedio ponderado de FedAvg. Adaptar el proyecto de demanda eléctrica a este paradigma hubiese requerido cambiar de familia de modelo (por ejemplo, a una red neuronal), lo cual es una reescritura de fondo del pipeline, no una extensión — dado el apuro de tiempo de la entrega, se priorizó seguir el enunciado con el dataset alternativo que permite explícitamente (`digits`, de scikit-learn), siguiendo el notebook-tutorial de la cátedra.
 
@@ -296,7 +297,7 @@ noise_std=0.10 -> accuracy 0.947
 
 Con ruido bajo (0.01) el efecto fue casi nulo — de hecho levemente mejor que sin ruido en absoluto, posiblemente porque un ruido chico actúa parecido a una regularización, atenuando el sobreajuste de los clientes individuales. A partir de ahí, la accuracy cae de forma consistente al subir el ruido — el trade-off medible que pide el enunciado: ganar privacidad (más ruido, menos información filtrada por cliente) cuesta calidad del modelo global, y la relación no es necesariamente lineal desde el principio (el primer tramo de ruido es casi gratis).
 
-## 11. Mini-TP 6: Data Lake
+## 11. Data Lake
 
 ### 11.1. Data Lake vs Data Warehouse, y por qué importa para ML
 
@@ -306,7 +307,7 @@ El riesgo de este enfoque es terminar con un **data swamp** — un lake sin orga
 
 ### 11.2. Por qué un bucket separado del de MLflow
 
-El proyecto ya tenía un bucket (`mlflow-artifacts`) que usa MLflow internamente como artifact store — ahí es donde `mlflow.sklearn.log_model()` sube el modelo cuando se llama desde `train.py` (ver sección 4). Para este mini-TP se creó un bucket **nuevo y separado** (`datalake`), con sus propias zonas gestionadas directamente con `boto3`, en vez de reusar el bucket de MLflow. La razón: son responsabilidades distintas — `mlflow-artifacts` es un detalle de implementación interno de MLflow (su estructura de carpetas la define MLflow, no se gestiona a mano), mientras que `datalake` es la infraestructura de datos del proyecto en sí, con una estructura de zonas pensada y controlada explícitamente, independiente de qué herramienta de tracking se use.
+El proyecto ya tenía un bucket (`mlflow-artifacts`) que usa MLflow internamente como artifact store — ahí es donde `mlflow.sklearn.log_model()` sube el modelo cuando se llama desde `train.py` (ver sección 4). Para esta capa se creó un bucket **nuevo y separado** (`datalake`), con sus propias zonas gestionadas directamente con `boto3`, en vez de reusar el bucket de MLflow. La razón: son responsabilidades distintas — `mlflow-artifacts` es un detalle de implementación interno de MLflow (su estructura de carpetas la define MLflow, no se gestiona a mano), mientras que `datalake` es la infraestructura de datos del proyecto en sí, con una estructura de zonas pensada y controlada explícitamente, independiente de qué herramienta de tracking se use.
 
 ### 11.3. El mismo `boto3`, dos endpoints distintos
 
@@ -319,7 +320,7 @@ El proyecto ahora tiene dos formas distintas de llegar al mismo modelo:
 - **Vía MLflow** (`predict.load_model()`, usado por las tres APIs): resuelve el alias `production` en el Model Registry, que internamente sabe en qué artifact store (MinIO) y bajo qué ruta están los archivos, y los descarga a través de la API de MLflow.
 - **Vía Data Lake directo** (`datalake.load_model_from_lake()`): descarga `models/v1/model.joblib` del bucket `datalake` con `boto3` puro, sin que MLflow intervenga en absoluto.
 
-Ambos caminos, probados con el mismo caso de entrada, dieron exactamente la misma predicción (30694.1 MW) — confirma que son consistentes entre sí, aunque recorran infraestructura distinta para llegar al mismo resultado. El modelo que vive en `datalake/models/v1/` es una **copia** del que está en el registry de MLflow en el momento de la subida (`scripts/upload_to_datalake.py` lo baja de MLflow una vez y lo resube plano) — no se actualiza sola si se reentrena y se promueve una versión nueva; haría falta correr el script de nuevo para sincronizarla. Esa es una limitación real de tener dos fuentes de verdad en paralelo, aceptable para los fines de este mini-TP pero algo a resolver (automatizar la sincronización, o elegir un solo camino) en un sistema de producción real.
+Ambos caminos, probados con el mismo caso de entrada, dieron exactamente la misma predicción (30694.1 MW) — confirma que son consistentes entre sí, aunque recorran infraestructura distinta para llegar al mismo resultado. El modelo que vive en `datalake/models/v1/` es una **copia** del que está en el registry de MLflow en el momento de la subida (`scripts/upload_to_datalake.py` lo baja de MLflow una vez y lo resube plano) — no se actualiza sola si se reentrena y se promueve una versión nueva; haría falta correr el script de nuevo para sincronizarla. Esa es una limitación real de tener dos fuentes de verdad en paralelo, aceptable para los fines de esta sección pero algo a resolver (automatizar la sincronización, o elegir un solo camino) en un sistema de producción real.
 
 ### 11.5. La reflexión: ¿lake o imagen horneada?
 
@@ -381,12 +382,147 @@ El workflow de GitHub Actions (`.github/workflows/ci.yml`) corre en cada push a 
 
 **Por qué no entrena ni levanta las APIs en el CI:** en una etapa temprana del proyecto, cuando el modelo se guardaba como archivos `.joblib` sueltos, el CI sí entrenaba un modelo en modo rápido y probaba la API end-to-end contra un servidor real. Al integrar MLflow, esto dejó de ser viable sin más trabajo: entrenar y servir el modelo ahora requieren Postgres, MinIO y MLflow corriendo, que el runner de GitHub Actions no tiene por defecto. Levantar todo ese stack dentro del CI (con sus healthchecks, creación de bucket, etc.) es una inversión de infraestructura considerable para el beneficio que aporta en esta etapa del proyecto — quedó documentado como decisión consciente, no como una limitación no notada. El CI actual es honesto sobre lo que garantiza: código bien formateado y sin errores triviales de import, no una corrida end-to-end del sistema completo.
 
-## 14. Decisiones de alcance y qué quedó afuera
+## 14. Seguridad y gobernanza (SAIF)
+
+### 14.1. Por qué seguridad va al final, y por qué igual se aplicó a las seis capas
+
+Cada capa anterior (REST, GraphQL, gRPC, streaming, federado, Data Lake) sumó una
+capacidad nueva al sistema — y, con ella, una superficie de ataque nueva. Seguridad no es
+una capa más al lado de las demás: es transversal, y recién tiene sentido completo una vez
+que existe algo real para proteger. Por eso se encaró al final, usando el marco **SAIF**
+(Secure AI Framework) para mapear, en cada capa, qué riesgo es específico de servir un
+modelo de ML (no solo riesgo genérico de aplicaciones web) y qué control lo mitiga.
+
+Se decidió aplicar el patrón a las seis capas, no a una sola, porque el proyecto ya había
+integrado las seis de forma real — dejar cinco sin ningún control de seguridad habría sido
+una inconsistencia notoria con el resto del nivel de profundidad del proyecto.
+
+### 14.2. El patrón repetido en cada notebook
+
+Los seis notebooks (`notebooks/07` a `12`) siguen la misma estructura: primero se muestra
+cómo está servida la capa **hoy**, sin ningún control (reutilizando el código real de
+`src/tp_mlops2/`, no una versión simplificada aparte) — esto deja a la vista el problema
+real, no uno hipotético. Después se construye el control principal sobre ese mismo código,
+y se verifica con casos concretos (códigos de estado esperados, accuracy medida, archivos
+realmente manipulados y detectados). Cierra con una reflexión que conecta el control
+aplicado con el elemento de SAIF que cubre y la amenaza concreta que mitiga.
+
+### 14.3. REST — autenticación, rol y rate limiting
+
+El riesgo real: `/v1/predict` responde a cualquiera sin límite, habilitando *scraping* del
+modelo (reconstruirlo por consultas masivas) y abuso de recursos. Se agregó API key +
+rate limiting sobre el endpoint de predicción, y autorización por rol vía JWT sobre un
+endpoint más sensible (`/v1/model/metrics`, que expone métricas internas del modelo). Un
+registro de auditoría en memoria deja trazado cada intento fallido y cada acceso exitoso —
+la medida de gobernanza del enunciado.
+
+**Resultado medido:** sin credenciales → 401; payload con la cantidad incorrecta de
+features → 422; sexta request en el mismo minuto → 429; rol insuficiente contra el
+endpoint de métricas → 403.
+
+### 14.4. GraphQL — introspección, profundidad y autorización por campo
+
+El esquema real (`strawberry.Schema(query=Query)`, sin extensiones) expone introspección
+completa sin credenciales — cualquiera puede mapear el esquema entero, incluyendo que
+existe un campo `lineage` que dispara una consulta a Neo4j más costosa que el resto. Se
+desactivó la introspección (`NoSchemaIntrospectionCustomRule`), se limitó la profundidad
+de las queries (`QueryDepthLimiter`), y se agregó autorización por campo específicamente
+sobre `lineage` — no sobre todo el esquema, porque no todos los campos tienen el mismo
+costo ni la misma sensibilidad.
+
+**Resultado medido:** la query de introspección, antes exitosa, devuelve un error explícito
+de GraphQL tras el control; `lineage` sin un rol autorizado en el contexto se rechaza, y
+con rol autorizado trae los 18 nodos reales del grafo de linaje (el mismo número que ya se
+documentó en la sección 7.3); una query de profundidad 3 contra un límite de 1 se corta
+antes de ejecutarse.
+
+### 14.5. gRPC — interceptor de autenticación y límite de mensaje
+
+El servidor real corre con `add_insecure_port` y sin ningún interceptor — ni autenticación
+ni cifrado de canal. Se agregó un `grpc.ServerInterceptor` que exige un JWT válido en el
+metadata `authorization` de cada llamada (no un token fijo, para que el control sea
+representativo de un caso real), y un límite de tamaño de mensaje para evitar que un
+cliente fuerce al servidor a deserializar payloads anormalmente grandes. El paso a TLS
+(`add_secure_port` con `ssl_server_credentials`) se documentó como el control
+complementario que falta para proteger el canal en sí, no solo la autenticación — se deja
+conceptual porque requiere certificados reales, fuera del alcance de una demostración en
+memoria.
+
+**Resultado medido:** levantando el servicer real (el mismo que usa `grpc_api/server.py`
+en producción) sin interceptor, cualquier llamada sin credenciales devuelve la predicción
+real (30694 MW, la misma de siempre); con el interceptor, una llamada sin token o con un
+JWT vencido devuelve `UNAUTHENTICATED`, y una con JWT válido sigue devolviendo la misma
+predicción.
+
+### 14.6. Streaming — validación de esquema, firma HMAC y cuarentena
+
+El consumidor real confía en todo lo que llega al topic `demanda-eventos`. Se definió un
+esquema Pydantic con los rangos físicamente plausibles del dataset real (temperaturas entre
+-15°C y 50°C, demanda no negativa) y una firma HMAC que el consumidor verifica contra un
+secreto compartido con el productor. Los eventos que fallan cualquiera de los dos controles
+van a una cola de cuarentena (DLQ) en vez de descartarse silenciosamente, y una política
+simple de alerta dispara si se acumulan varios eventos en cuarentena en poco tiempo —
+señal de un ataque en curso, no de ruido aislado de sensor.
+
+**Resultado medido, y el porqué de tener ambos controles por separado:** un evento con
+firma inválida se frena antes de llegar a la validación de esquema (no sabemos de dónde
+vino, no importa si sus valores son razonables); un evento firmado correctamente pero con
+una temperatura de 900°C y una demanda negativa se frena igual, por la validación de
+esquema — demostrando que un productor "autorizado" con datos rotos no es menos peligroso
+que un productor no autorizado con datos con buena forma.
+
+### 14.7. Aprendizaje federado — agregación robusta contra un cliente malicioso real
+
+El riesgo más serio de los seis: FedAvg con promedio simple no distingue una actualización
+legítima de una maliciosa. Se simuló un cliente que entrena localmente como cualquier otro,
+pero escala e invierte su update antes de mandarlo (*model poisoning*) — sobre el mismo
+esquema de `notebooks/06_federated_learning.ipynb` (softmax desde cero en numpy, dataset
+`digits`, 5 clientes). Se reemplazó el promedio ponderado por la **mediana por coordenada**
+de los pesos entre clientes, y se combinó con el *clipping* de norma y la privacidad
+diferencial que ya existían en el notebook original.
+
+**Resultado medido:** FedAvg con promedio simple, sin ataque, llega a 0.971 de accuracy —
+con un solo cliente malicioso (de 5), colapsa a **0.000**. Con agregación por mediana, el
+mismo ataque deja la accuracy en **0.931**; sumando *clipping* + ruido gaussiano
+(`noise_std=0.01`, protegiendo además la privacidad de los clientes legítimos), queda en
+**0.936**. La combinación de las tres defensas no solo resiste el ataque, sino que lo hace
+sin sacrificar casi nada frente a la mediana sola.
+
+### 14.8. Data Lake — integridad, acceso temporal y zonas
+
+El bucket `datalake` real se lee y escribe hoy con las credenciales maestras de MinIO, sin
+ningún mecanismo que detecte si un artefacto fue alterado entre una subida y la siguiente
+lectura. Se calculó el SHA-256 real del modelo en producción (`models/v1/model.joblib`,
+~32 MB) y se publicó junto al artefacto, verificándolo en cada carga. Se demostró el
+control manipulando temporalmente el objeto real en el bucket (y restaurándolo
+inmediatamente después, verificado con una carga posterior del modelo). Se reemplazó el
+acceso directo con credenciales maestras por URLs prefirmadas con expiración de 60
+segundos, y se documentó — sin aplicarla a nivel de IAM real de MinIO local, que queda
+fuera de alcance — una política de acceso mínimo diferenciada por zona (`raw/` y
+`curated/` solo escribibles por el proceso de ingesta, `models/` de solo lectura para el
+servicio de predicción).
+
+**Resultado medido:** la carga legítima del modelo real verifica el checksum sin
+problema; tras sustituir el contenido del objeto en el bucket por datos arbitrarios, la
+misma función de carga detecta la discrepancia y rechaza el artefacto con un error
+explícito, antes de que llegue a deserializarse.
+
+### 14.9. Qué queda fuera de estos seis notebooks
+
+Los controles se demuestran sobre el código y los datos reales del proyecto, pero no se
+integraron de vuelta a los servicios que corren en Docker Compose (la API REST en
+producción, por ejemplo, sigue sin rate limiting real) — es una decisión de alcance
+explícita: la demostración de cada control, aplicada y verificada contra el sistema real,
+es lo que pide el enunciado; integrarlos de forma permanente a cada servicio productivo
+es un paso adicional razonable para una iteración futura, no parte de esta entrega.
+
+## 15. Decisiones de alcance y qué quedó afuera
 
 - **Orden de trabajo — infraestructura containerizada desde el principio, no al final:** se decidió explícitamente ir sumando cada pieza (MLflow, luego Neo4j, luego cada API, luego Redpanda, luego Airflow) directamente como servicios de Docker Compose a medida que se armaban, en vez de resolver todo en local primero y containerizar recién al final. La ventaja de containerizar temprano es que el entorno final se prueba de entrada, en vez de descubrir problemas de containerización (como los de red interna descriptos en 5.3, o el conflicto de dependencias de Airflow descripto en 12.2) recién al empaquetar un sistema ya grande.
 - **Adelantar tecnologías de clases posteriores:** Docker, MLflow, streaming, y el nivel de contenedores en general corresponden a clases más avanzadas del curso (MLflow se presenta formalmente en la Clase 2, Docker se profundiza en la Sesión 5, streaming es la Sesión 4) — se decidió avanzar con ellas de todos modos, conscientes de que un enfoque distinto presentado más adelante en el curso podría requerir ajustes.
 - **El CI no cubre el sistema completo**, como se explica en la sección 13 — es una limitación conocida y documentada, no un descuido.
-- **El Mini-TP 5 (federado) es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
+- **El entrenamiento federado es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
 - **El consumidor y los productores de streaming no están containerizados.** A diferencia de las tres APIs (procesos de servidor persistentes, con un ciclo de vida claro de "levantar y dejar corriendo"), el consumidor de Kafka es un proceso de larga vida pero los productores son scripts de una sola pasada — no tienen el mismo encaje natural en un `docker-compose.yml` pensado para servicios. Quedaron como scripts que se corren a mano con `uv run`, contra el broker Redpanda que sí está containerizado.
-- **La copia del modelo en el Data Lake no se sincroniza sola con el registry de MLflow**, como se explica en 11.4 — si se reentrena y se promueve una versión nueva a `production`, hay que volver a correr `scripts/upload_to_datalake.py` a mano para que la copia del lake quede al día. Es una limitación real de tener dos fuentes de verdad en paralelo, aceptada conscientemente para el alcance de este mini-TP.
+- **La copia del modelo en el Data Lake no se sincroniza sola con el registry de MLflow**, como se explica en 11.4 — si se reentrena y se promueve una versión nueva a `production`, hay que volver a correr `scripts/upload_to_datalake.py` a mano para que la copia del lake quede al día. Es una limitación real de tener dos fuentes de verdad en paralelo, aceptada conscientemente para el alcance de esta sección.
+- **Los controles de seguridad de la sección 14 no se integraron de forma permanente a los servicios de Docker Compose** — se demuestran y verifican contra el código y los datos reales del proyecto en notebooks dedicados, pero la API REST, el esquema GraphQL, el servidor gRPC, el consumidor de streaming y el acceso al Data Lake que corren en producción siguen sin esos controles activos. Es una decisión de alcance explícita: lo que pide el enunciado es demostrar el control aplicado y verificado, no necesariamente dejarlo activo de forma permanente en cada servicio.
 - **El Hito TP #1 grupal** (equipo, roles, diagrama de arquitectura — mencionado en el enunciado de la Sesión 4) y **el Hito TP #2** (checkpoint del integrador, mencionado en la Sesión 6) están fuera del alcance de este documento, que cubre el trabajo individual sobre el modelo de demanda eléctrica.

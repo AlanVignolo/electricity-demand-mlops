@@ -15,3 +15,6 @@ data/processed/
 models/*.joblib
 
 .env
+
+# Material de estudio personal, no parte del entregable
+docs/

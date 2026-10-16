@@ -3,7 +3,7 @@ from fastapi import Depends, FastAPI
 from mlflow.tracking import MlflowClient
 
 from tp_mlops2.api.schemas import ModelInfo, PredictionRequest, PredictionResponse
-from tp_mlops2.api.security import auditar, requiere_rol, rate_limit
+from tp_mlops2.api.security import auditar, rate_limit, requiere_rol
 from tp_mlops2.features import add_cyclical_features
 from tp_mlops2.predict import (
     MLFLOW_TRACKING_URI,
@@ -45,7 +45,9 @@ def model_metrics(usuario: dict = Depends(requiere_rol("admin", "analista"))) ->
 
 
 @app.post("/v1/predict", response_model=PredictionResponse)
-def predict_load(request: PredictionRequest, cliente: str = Depends(rate_limit)) -> PredictionResponse:
+def predict_load(
+    request: PredictionRequest, cliente: str = Depends(rate_limit)
+) -> PredictionResponse:
     row = pd.DataFrame(
         [{
             "hour": request.timestamp.hour,

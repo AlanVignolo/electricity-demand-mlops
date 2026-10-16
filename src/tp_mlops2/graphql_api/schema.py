@@ -2,8 +2,10 @@ import os
 
 import strawberry
 from dotenv import load_dotenv
+from graphql import NoSchemaIntrospectionCustomRule
 from mlflow.tracking import MlflowClient
 from neo4j import GraphDatabase
+from strawberry.extensions import AddValidationRules, QueryDepthLimiter
 
 from tp_mlops2.predict import MLFLOW_TRACKING_URI, MODEL_ALIAS, REGISTERED_MODEL_NAME
 
@@ -32,7 +34,6 @@ class Model:
     version: str
     metrics: Metrics
 
-    @strawberry.field
     def lineage(self) -> list[LineageNode]:
         driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         with driver.session() as session:
@@ -73,5 +74,20 @@ class Query:
     def model(self, name: str) -> Model:
         return get_model()
 
+    @strawberry.field
+    def lineage(self, info: strawberry.Info) -> list[LineageNode]:
+        # autorizacion por campo: el linaje completo (consulta a Neo4j) es mas
+        # costoso y mas sensible que las metricas, solo para roles autorizados
+        rol = info.context.get("rol")
+        if rol not in ("analista", "admin"):
+            raise Exception("no autorizado: el campo lineage requiere rol analista o admin")
+        return get_model().lineage()
 
-schema = strawberry.Schema(query=Query)
+
+schema = strawberry.Schema(
+    query=Query,
+    extensions=[
+        lambda: AddValidationRules([NoSchemaIntrospectionCustomRule]),
+        lambda: QueryDepthLimiter(max_depth=4),
+    ],
+)

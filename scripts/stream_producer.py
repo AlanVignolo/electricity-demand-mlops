@@ -5,6 +5,7 @@ from pathlib import Path
 from kafka import KafkaProducer
 
 from tp_mlops2.data import clean_and_merge, load_raw
+from tp_mlops2.streaming.security import firmar
 
 TOPIC = "demanda-eventos"
 BOOTSTRAP_SERVERS = "localhost:9092"
@@ -39,7 +40,8 @@ def main():
             "load_lag_24h": float(row["total load actual"]),
             "load_lag_168h": float(row["total load actual"]),
         }
-        producer.send(TOPIC, value=event)
+        envelope = {"payload": event, "firma": firmar(event)}
+        producer.send(TOPIC, value=envelope)
         time.sleep(DELAY_SECONDS)
 
     producer.flush()

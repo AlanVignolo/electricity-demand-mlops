@@ -5,12 +5,17 @@ from pathlib import Path
 from kafka import KafkaProducer
 
 from tp_mlops2.data import clean_and_merge, load_raw
+from tp_mlops2.streaming.security import firmar
 
 TOPIC = "demanda-eventos"
 BOOTSTRAP_SERVERS = "localhost:9092"
 DELAY_SECONDS = 0.2
-TEMP_SHIFT_CELSIUS = 30.0
 FIXED_HOT_TEMP = 45.0
+# La demanda real de 2018 va de ~18.179 a ~40.693 MW (media ~29.065). Un lag
+# de carga muy por fuera de ese rango, pero dentro de lo que el esquema de
+# streaming acepta (0 a 60.000), fuerza al modelo a extrapolar con fuerza,
+# porque los lags de carga pesan mucho mas en la prediccion que la temperatura.
+FIXED_LOW_LOAD = 0.0
 
 def build_stream_data():
     energy, weather = load_raw(Path("data"))
@@ -27,7 +32,8 @@ def main():
 
     print(
         f"Emitiendo {len(df)} eventos al topic '{TOPIC}' con temperaturas fijas "
-        f"de {FIXED_HOT_TEMP}°C en las 5 ciudades (simulación de ola de calor extrema)..."
+        f"de {FIXED_HOT_TEMP}°C y lags de carga fijos en {FIXED_LOW_LOAD:.0f} MW "
+        "(muy por debajo del rango real, ~18.179-40.693 MW)..."
     )
 
     for timestamp, row in df.iterrows():
@@ -42,10 +48,11 @@ def main():
             "temp_Valencia": FIXED_HOT_TEMP,
             "temp_Seville": FIXED_HOT_TEMP,
             "temp_Bilbao": FIXED_HOT_TEMP,
-            "load_lag_24h": float(row["total load actual"]),
-            "load_lag_168h": float(row["total load actual"]),
+            "load_lag_24h": FIXED_LOW_LOAD,
+            "load_lag_168h": FIXED_LOW_LOAD,
         }
-        producer.send(TOPIC, value=event)
+        envelope = {"payload": event, "firma": firmar(event)}
+        producer.send(TOPIC, value=envelope)
         time.sleep(DELAY_SECONDS)
 
     producer.flush()

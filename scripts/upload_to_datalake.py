@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 
@@ -46,14 +47,19 @@ def upload_models_zone(s3):
     joblib.dump(model, local_tmp)
 
     key = f"{MODEL_VERSION_PREFIX}/model.joblib"
+    sha256 = hashlib.sha256(local_tmp.read_bytes()).hexdigest()
     s3.upload_file(str(local_tmp), BUCKET, key)
     local_tmp.unlink()
+
+    checksum_key = f"{MODEL_VERSION_PREFIX}/model.sha256"
+    s3.put_object(Bucket=BUCKET, Key=checksum_key, Body=sha256.encode())
 
     joblib.dump(feature_cols, Path("feature_cols_tmp.joblib"))
     s3.upload_file("feature_cols_tmp.joblib", BUCKET, f"{MODEL_VERSION_PREFIX}/feature_cols.joblib")
     Path("feature_cols_tmp.joblib").unlink()
 
     print(f"Subido: s3://{BUCKET}/{key}")
+    print(f"Subido: s3://{BUCKET}/{checksum_key}")
     print(f"Subido: s3://{BUCKET}/{MODEL_VERSION_PREFIX}/feature_cols.joblib")
     print(f"Métricas del modelo (referencia): {metrics}")
 

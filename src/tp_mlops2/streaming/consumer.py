@@ -1,4 +1,5 @@
 import json
+import os
 import statistics
 import time
 
@@ -14,9 +15,10 @@ from tp_mlops2.predict import (
     load_model,
     predict,
 )
+from tp_mlops2.streaming.security import chequear_alerta_dlq, consumir_validado
 
 TOPIC = "demanda-eventos"
-BOOTSTRAP_SERVERS = "localhost:9092"
+BOOTSTRAP_SERVERS = os.environ.get("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
 WINDOW_SIZE = 20
 DRIFT_THRESHOLD_STD = 1.0
 
@@ -73,12 +75,20 @@ def main():
     window_preds = []
     window_latencies = []
     window_num = 0
+    window_dlq: list[dict] = []
 
     print(f"Referencia de drift: {ref_source or 'primera ventana del stream'}\n")
 
     for message in consumer:
         start = time.perf_counter()
-        row = build_row(message.value)
+
+        envelope = message.value
+        evento_validado = consumir_validado(envelope["payload"], envelope["firma"])
+        if evento_validado is None:
+            window_dlq.append(envelope)
+            continue
+
+        row = build_row(evento_validado)
         y_pred = predict(model, row, feature_cols)
         latency_ms = (time.perf_counter() - start) * 1000
 
@@ -115,9 +125,15 @@ def main():
                     f"respecto a la referencia ({ref_source})"
                 )
 
+            if chequear_alerta_dlq(window_dlq):
+                print(
+                    f"  ALERTA: {len(window_dlq)} eventos en cuarentena en esta ventana "
+                    "- posible ataque de envenenamiento o productor comprometido en curso"
+                )
 
             window_preds = []
             window_latencies = []
+            window_dlq = []
 
 
 if __name__ == "__main__":

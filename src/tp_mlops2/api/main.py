@@ -1,8 +1,9 @@
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from mlflow.tracking import MlflowClient
 
 from tp_mlops2.api.schemas import ModelInfo, PredictionRequest, PredictionResponse
+from tp_mlops2.api.security import auditar, requiere_rol, rate_limit
 from tp_mlops2.features import add_cyclical_features
 from tp_mlops2.predict import (
     MLFLOW_TRACKING_URI,
@@ -37,8 +38,14 @@ def model_info() -> ModelInfo:
     )
 
 
+@app.get("/v1/model/metrics")
+def model_metrics(usuario: dict = Depends(requiere_rol("admin", "analista"))) -> dict:
+    auditar(usuario["sub"], "consulta_metricas", "acceso a /v1/model/metrics")
+    return {"mae_mw": metrics["mae_mw"], "mape": metrics["mape"]}
+
+
 @app.post("/v1/predict", response_model=PredictionResponse)
-def predict_load(request: PredictionRequest) -> PredictionResponse:
+def predict_load(request: PredictionRequest, cliente: str = Depends(rate_limit)) -> PredictionResponse:
     row = pd.DataFrame(
         [{
             "hour": request.timestamp.hour,
@@ -58,6 +65,7 @@ def predict_load(request: PredictionRequest) -> PredictionResponse:
     row = add_cyclical_features(row)
 
     y_pred = predict(model, row, feature_cols)
+    auditar(cliente, "prediccion", f"{y_pred.iloc[0]:.1f} MW")
 
     return PredictionResponse(
         predicted_load_mw=float(y_pred.iloc[0]),

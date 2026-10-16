@@ -1,6 +1,7 @@
 
 import grpc
 
+from tp_mlops2.auth import crear_token
 from tp_mlops2.grpc_api import scoring_pb2, scoring_pb2_grpc
 
 SAMPLE_REQUEST = {
@@ -15,9 +16,14 @@ SAMPLE_REQUEST = {
 }
 
 
+def _auth_metadata():
+    token = crear_token("alan", "analista")
+    return (("authorization", f"Bearer {token}"),)
+
+
 def predict_unary(stub):
     request = scoring_pb2.PredictRequest(**SAMPLE_REQUEST)
-    response = stub.Predict(request)
+    response = stub.Predict(request, metadata=_auth_metadata())
     print(
         f"Predicción unary: {response.predicted_load_mw:.1f} MW "
         f"(modelo {response.model_version})"
@@ -30,7 +36,7 @@ def predict_batch(stub, n=5):
     batch_request = scoring_pb2.BatchPredictRequest(requests=requests)
 
     print(f"Predicción batch (server-streaming, {n} items):")
-    for response in stub.PredictBatch(batch_request):
+    for response in stub.PredictBatch(batch_request, metadata=_auth_metadata()):
         print(f"  {response.predicted_load_mw:.1f} MW")
 
 

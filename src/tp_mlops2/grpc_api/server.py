@@ -2,11 +2,39 @@ import time
 from concurrent import futures
 
 import grpc
+import jwt
 import pandas as pd
 
+from tp_mlops2.auth import decodificar_token
 from tp_mlops2.features import add_cyclical_features
 from tp_mlops2.grpc_api import scoring_pb2, scoring_pb2_grpc
 from tp_mlops2.predict import MODEL_ALIAS, REGISTERED_MODEL_NAME, load_model, predict
+
+MAX_MESSAGE_BYTES = 4 * 1024 * 1024  # 4 MB: suficiente para un PredictRequest, no para abuso
+
+
+class AuthInterceptor(grpc.ServerInterceptor):
+    """Verifica un JWT en el metadata 'authorization' antes de dejar pasar la llamada."""
+
+    def __init__(self):
+        self._denegado = grpc.unary_unary_rpc_method_handler(
+            lambda req, ctx: ctx.abort(grpc.StatusCode.UNAUTHENTICATED, "token invalido o ausente")
+        )
+
+    def intercept_service(self, continuation, handler_call_details):
+        metadata = dict(handler_call_details.invocation_metadata or [])
+        auth_header = metadata.get("authorization", "")
+
+        if not auth_header.startswith("Bearer "):
+            return self._denegado
+
+        token = auth_header.removeprefix("Bearer ")
+        try:
+            decodificar_token(token)
+        except jwt.PyJWTError:
+            return self._denegado
+
+        return continuation(handler_call_details)
 
 
 class ScoringServicer(scoring_pb2_grpc.ScoringServicer):
@@ -53,7 +81,14 @@ class ScoringServicer(scoring_pb2_grpc.ScoringServicer):
 
 
 def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        interceptors=[AuthInterceptor()],
+        options=[
+            ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
+        ],
+    )
     scoring_pb2_grpc.add_ScoringServicer_to_server(ScoringServicer(), server)
     server.add_insecure_port("[::]:50051")
     server.start()

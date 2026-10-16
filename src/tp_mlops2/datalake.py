@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 
@@ -22,16 +23,33 @@ def get_s3_client():
     )
 
 
+def cargar_verificando(s3, bucket: str, key_modelo: str, key_checksum: str) -> bytes:
+    """Descarga un artefacto y verifica su SHA-256 contra el checksum publicado
+    junto a el. Si no coinciden, el artefacto fue manipulado y no se carga."""
+    esperado = s3.get_object(Bucket=bucket, Key=key_checksum)["Body"].read().decode()
+    blob = s3.get_object(Bucket=bucket, Key=key_modelo)["Body"].read()
+    real = hashlib.sha256(blob).hexdigest()
+    if real != esperado:
+        raise ValueError(
+            f"INTEGRIDAD ROTA: esperado {esperado[:16]}..., obtenido {real[:16]}... "
+            "- el artefacto fue manipulado, no se carga."
+        )
+    return blob
+
+
 def load_model_from_lake():
-    """Descarga el modelo y la lista de features
-    directo del Data Lake (boto3 + joblib, sin MLflow)."""
+    """Descarga el modelo y la lista de features directo del Data Lake
+    (boto3 + joblib, sin MLflow), verificando el checksum del modelo."""
     s3 = get_s3_client()
 
     tmp_dir = Path("/tmp") if Path("/tmp").exists() else Path(".")
     model_path = tmp_dir / "lake_model.joblib"
     features_path = tmp_dir / "lake_feature_cols.joblib"
 
-    s3.download_file(BUCKET, f"{MODEL_VERSION_PREFIX}/model.joblib", str(model_path))
+    model_blob = cargar_verificando(
+        s3, BUCKET, f"{MODEL_VERSION_PREFIX}/model.joblib", f"{MODEL_VERSION_PREFIX}/model.sha256"
+    )
+    model_path.write_bytes(model_blob)
     s3.download_file(BUCKET, f"{MODEL_VERSION_PREFIX}/feature_cols.joblib", str(features_path))
 
     model = joblib.load(model_path)

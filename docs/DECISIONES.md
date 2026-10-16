@@ -397,74 +397,86 @@ Se decidió aplicar el patrón a las seis capas, no a una sola, porque el proyec
 integrado las seis de forma real — dejar cinco sin ningún control de seguridad habría sido
 una inconsistencia notoria con el resto del nivel de profundidad del proyecto.
 
-### 14.2. El patrón repetido en cada notebook
+### 14.2. Los controles viven en `src/`, no solo en los notebooks
 
-Los seis notebooks (`notebooks/07` a `12`) siguen la misma estructura: primero se muestra
-cómo está servida la capa **hoy**, sin ningún control (reutilizando el código real de
-`src/tp_mlops2/`, no una versión simplificada aparte) — esto deja a la vista el problema
-real, no uno hipotético. Después se construye el control principal sobre ese mismo código,
-y se verifica con casos concretos (códigos de estado esperados, accuracy medida, archivos
-realmente manipulados y detectados). Cierra con una reflexión que conecta el control
-aplicado con el elemento de SAIF que cubre y la amenaza concreta que mitiga.
+Las cinco capas productivas (REST, GraphQL, gRPC, streaming, Data Lake) tienen sus
+controles integrados directamente en el código que corre en los contenedores de Docker
+Compose — `src/tp_mlops2/api/security.py`, `graphql_api/schema.py`, `grpc_api/server.py`,
+`streaming/security.py` y `datalake.py` — y están activos todo el tiempo, no solo cuando
+se corre un notebook. Los seis notebooks (`notebooks/07` a `12`) prueban esos mismos
+controles reales desde afuera, como lo haría cualquier cliente: REST, GraphQL y gRPC por
+HTTP/gRPC contra el servicio Docker corriendo; streaming y Data Lake llamando
+directamente a las funciones de seguridad que usan el consumidor y los scripts de
+publicación. El entrenamiento federado es la única excepción — ver 14.7 — porque corre
+como una simulación aparte, sobre otro modelo.
 
 ### 14.3. REST — autenticación, rol y rate limiting
 
-El riesgo real: `/v1/predict` responde a cualquiera sin límite, habilitando *scraping* del
-modelo (reconstruirlo por consultas masivas) y abuso de recursos. Se agregó API key +
-rate limiting sobre el endpoint de predicción, y autorización por rol vía JWT sobre un
-endpoint más sensible (`/v1/model/metrics`, que expone métricas internas del modelo). Un
-registro de auditoría en memoria deja trazado cada intento fallido y cada acceso exitoso —
-la medida de gobernanza del enunciado.
+El riesgo real: `/v1/predict`, sin control, respondería a cualquiera sin límite,
+habilitando *scraping* del modelo (reconstruirlo por consultas masivas) y abuso de
+recursos. `src/tp_mlops2/api/security.py` agrega API key + rate limiting sobre el
+endpoint de predicción, y autorización por rol vía JWT sobre un endpoint más sensible
+(`/v1/model/metrics`, que expone métricas internas del modelo), ambos activos en el
+contenedor `api` real. Un registro de auditoría en memoria deja trazado cada intento
+fallido y cada acceso exitoso — la medida de gobernanza del enunciado.
 
-**Resultado medido:** sin credenciales → 401; payload con la cantidad incorrecta de
-features → 422; sexta request en el mismo minuto → 429; rol insuficiente contra el
-endpoint de métricas → 403.
+**Resultado medido contra el servicio real en `localhost:8000`:** sin credenciales → 401;
+payload inválido → 422; la request que excede el límite por minuto → 429; rol
+insuficiente contra el endpoint de métricas → 403; con API key y JWT correctos, la misma
+predicción real de siempre (30694 MW).
 
 ### 14.4. GraphQL — introspección, profundidad y autorización por campo
 
-El esquema real (`strawberry.Schema(query=Query)`, sin extensiones) expone introspección
-completa sin credenciales — cualquiera puede mapear el esquema entero, incluyendo que
-existe un campo `lineage` que dispara una consulta a Neo4j más costosa que el resto. Se
-desactivó la introspección (`NoSchemaIntrospectionCustomRule`), se limitó la profundidad
-de las queries (`QueryDepthLimiter`), y se agregó autorización por campo específicamente
-sobre `lineage` — no sobre todo el esquema, porque no todos los campos tienen el mismo
-costo ni la misma sensibilidad.
+Sin control, el esquema expondría introspección completa sin credenciales — cualquiera
+podría mapear el esquema entero, incluyendo que existe un campo `lineage` que dispara una
+consulta a Neo4j más costosa que el resto. El esquema real en
+`src/tp_mlops2/graphql_api/schema.py` desactiva la introspección
+(`NoSchemaIntrospectionCustomRule`), limita la profundidad de las queries
+(`QueryDepthLimiter(max_depth=4)`), y agrega autorización por campo específicamente sobre
+`lineage` — no sobre todo el esquema, porque no todos los campos tienen el mismo costo ni
+la misma sensibilidad. El rol llega vía JWT en el header `Authorization`, decodificado por
+un `context_getter` en `graphql_api/main.py` y expuesto en `info.context`.
 
-**Resultado medido:** la query de introspección, antes exitosa, devuelve un error explícito
-de GraphQL tras el control; `lineage` sin un rol autorizado en el contexto se rechaza, y
-con rol autorizado trae los 18 nodos reales del grafo de linaje (el mismo número que ya se
-documentó en la sección 7.3); una query de profundidad 3 contra un límite de 1 se corta
-antes de ejecutarse.
+**Resultado medido contra el servicio real en `localhost:8001/graphql`:** la query de
+introspección devuelve un error explícito de GraphQL; `lineage` sin token se rechaza, y
+con un JWT de rol `analista` trae los 18 nodos reales del grafo de linaje (el mismo
+número que ya se documentó en la sección 7.3); `model`, que no requiere rol, responde
+igual con o sin token.
 
 ### 14.5. gRPC — interceptor de autenticación y límite de mensaje
 
-El servidor real corre con `add_insecure_port` y sin ningún interceptor — ni autenticación
-ni cifrado de canal. Se agregó un `grpc.ServerInterceptor` que exige un JWT válido en el
-metadata `authorization` de cada llamada (no un token fijo, para que el control sea
-representativo de un caso real), y un límite de tamaño de mensaje para evitar que un
-cliente fuerce al servidor a deserializar payloads anormalmente grandes. El paso a TLS
-(`add_secure_port` con `ssl_server_credentials`) se documentó como el control
-complementario que falta para proteger el canal en sí, no solo la autenticación — se deja
-conceptual porque requiere certificados reales, fuera del alcance de una demostración en
-memoria.
+Sin control, el servidor correría con `add_insecure_port` y sin ningún interceptor — ni
+autenticación ni límite de tamaño de mensaje. `src/tp_mlops2/grpc_api/server.py` agrega un
+`AuthInterceptor(grpc.ServerInterceptor)` que exige un JWT válido en el metadata
+`authorization` de cada llamada (el mismo `tp_mlops2.auth` que usa REST, no un token fijo
+ni un mecanismo aparte), y un límite de tamaño de mensaje (4 MB) para evitar que un cliente
+fuerce al servidor a deserializar payloads anormalmente grandes. El interceptor corre
+sobre el `ScoringServicer` real, antes de que la llamada llegue al modelo. El cliente de
+ejemplo (`grpc_api/client.py`) manda el token en el metadata de cada llamada. El paso a TLS
+(`add_secure_port` con `ssl_server_credentials`) queda documentado como el control
+complementario que falta para proteger el canal en sí, no solo la autenticación — requiere
+certificados reales, fuera del alcance de esta entrega.
 
-**Resultado medido:** levantando el servicer real (el mismo que usa `grpc_api/server.py`
-en producción) sin interceptor, cualquier llamada sin credenciales devuelve la predicción
-real (30694 MW, la misma de siempre); con el interceptor, una llamada sin token o con un
-JWT vencido devuelve `UNAUTHENTICATED`, y una con JWT válido sigue devolviendo la misma
-predicción.
+**Resultado medido contra el servidor real en `localhost:50051`:** sin metadata de
+autenticación, la llamada devuelve `UNAUTHENTICATED` antes de tocar el modelo; con un JWT
+vencido, lo mismo; con un JWT válido, la misma predicción real de siempre (30694.1 MW).
 
 ### 14.6. Streaming — validación de esquema, firma HMAC y cuarentena
 
-El consumidor real confía en todo lo que llega al topic `demanda-eventos`. Se definió un
-esquema Pydantic con los rangos físicamente plausibles del dataset real (temperaturas entre
--15°C y 50°C, demanda no negativa) y una firma HMAC que el consumidor verifica contra un
-secreto compartido con el productor. Los eventos que fallan cualquiera de los dos controles
-van a una cola de cuarentena (DLQ) en vez de descartarse silenciosamente, y una política
-simple de alerta dispara si se acumulan varios eventos en cuarentena en poco tiempo —
-señal de un ataque en curso, no de ruido aislado de sensor.
+Sin control, el consumidor confiaría en todo lo que llega al topic `demanda-eventos`.
+`src/tp_mlops2/streaming/security.py` define un esquema Pydantic con los rangos
+físicamente plausibles del dataset real (temperaturas entre -15°C y 50°C, demanda no
+negativa) y una firma HMAC que el consumidor real (`streaming/consumer.py`) verifica
+contra un secreto compartido con el productor. `scripts/stream_producer.py` y
+`stream_producer_drift.py` firman cada evento antes de mandarlo a Redpanda, así que el
+mensaje en el topic ya no es el evento plano sino un sobre `{"payload", "firma"}`. Los
+eventos que fallan cualquiera de los dos controles van a una cola de cuarentena (DLQ) en
+vez de descartarse silenciosamente, y una política simple de alerta (`chequear_alerta_dlq`,
+el mismo umbral que usa el consumidor en cada ventana) dispara si se acumulan varios
+eventos en cuarentena en poco tiempo — señal de un ataque en curso, no de ruido aislado de
+sensor.
 
-**Resultado medido, y el porqué de tener ambos controles por separado:** un evento con
+**Resultado medido llamando a las funciones reales que usa el pipeline:** un evento con
 firma inválida se frena antes de llegar a la validación de esquema (no sabemos de dónde
 vino, no importa si sus valores son razonables); un evento firmado correctamente pero con
 una temperatura de 900°C y una demanda negativa se frena igual, por la validación de
@@ -488,19 +500,17 @@ mismo ataque deja la accuracy en **0.931**; sumando *clipping* + ruido gaussiano
 **0.936**. La combinación de las tres defensas no solo resiste el ataque, sino que lo hace
 sin sacrificar casi nada frente a la mediana sola.
 
-### 14.8. Data Lake — integridad, acceso temporal y zonas
+### 14.8. Data Lake — integridad real en cada carga
 
-El bucket `datalake` real se lee y escribe hoy con las credenciales maestras de MinIO, sin
-ningún mecanismo que detecte si un artefacto fue alterado entre una subida y la siguiente
-lectura. Se calculó el SHA-256 real del modelo en producción (`models/v1/model.joblib`,
-~32 MB) y se publicó junto al artefacto, verificándolo en cada carga. Se demostró el
-control manipulando temporalmente el objeto real en el bucket (y restaurándolo
-inmediatamente después, verificado con una carga posterior del modelo). Se reemplazó el
-acceso directo con credenciales maestras por URLs prefirmadas con expiración de 60
-segundos, y se documentó — sin aplicarla a nivel de IAM real de MinIO local, que queda
-fuera de alcance — una política de acceso mínimo diferenciada por zona (`raw/` y
-`curated/` solo escribibles por el proceso de ingesta, `models/` de solo lectura para el
-servicio de predicción).
+Sin control, el bucket `datalake` se leería y escribiría sin ningún mecanismo que detecte
+si un artefacto fue alterado entre una subida y la siguiente lectura. `scripts/upload_to_datalake.py`
+calcula el SHA-256 real del modelo (`models/v1/model.joblib`, ~32 MB) y lo publica junto al
+artefacto (`models/v1/model.sha256`) cada vez que sube una versión nueva.
+`src/tp_mlops2/datalake.py` agrega `cargar_verificando`, que recalcula el checksum en cada
+descarga y lo compara contra el publicado; `load_model_from_lake()` — la ruta directa al
+lake, sin pasar por MLflow — la usa siempre. Se demostró el control manipulando
+temporalmente el objeto real en el bucket y restaurándolo inmediatamente después,
+verificado con una carga posterior del modelo.
 
 **Resultado medido:** la carga legítima del modelo real verifica el checksum sin
 problema; tras sustituir el contenido del objeto en el bucket por datos arbitrarios, la
@@ -509,12 +519,13 @@ explícito, antes de que llegue a deserializarse.
 
 ### 14.9. Qué queda fuera de estos seis notebooks
 
-Los controles se demuestran sobre el código y los datos reales del proyecto, pero no se
-integraron de vuelta a los servicios que corren en Docker Compose (la API REST en
-producción, por ejemplo, sigue sin rate limiting real) — es una decisión de alcance
-explícita: la demostración de cada control, aplicada y verificada contra el sistema real,
-es lo que pide el enunciado; integrarlos de forma permanente a cada servicio productivo
-es un paso adicional razonable para una iteración futura, no parte de esta entrega.
+Los controles de las cinco capas productivas están integrados en `src/` y activos en los
+servicios de Docker Compose, no solo demostrados en un notebook aislado — ver 14.2. Lo
+que sí queda fuera de esta entrega es llevar esos controles a un nivel de madurez
+operacional mayor: rotación de secretos, TLS real en gRPC, políticas IAM aplicadas a nivel
+de servidor en MinIO (en vez de documentadas), y un almacenamiento persistente para la
+auditoría (hoy vive en memoria, se pierde al reiniciar el contenedor). Son mejoras
+razonables para una próxima iteración, no parte de esta entrega.
 
 ## 15. Decisiones de alcance y qué quedó afuera
 
@@ -524,5 +535,5 @@ es un paso adicional razonable para una iteración futura, no parte de esta entr
 - **El entrenamiento federado es un sistema aparte, no integrado al resto del proyecto.** Usa el dataset `digits`, no el de demanda eléctrica, por la incompatibilidad entre FedAvg (promedia parámetros de un modelo paramétrico) y Random Forest (no tiene parámetros promediables de esa forma) explicada en 10.1. Es una decisión consciente, priorizando entregar un resultado correcto sobre el dataset alternativo que el enunciado permite, en vez de forzar una adaptación de fondo del pipeline de demanda bajo presión de tiempo.
 - **El consumidor y los productores de streaming no están containerizados.** A diferencia de las tres APIs (procesos de servidor persistentes, con un ciclo de vida claro de "levantar y dejar corriendo"), el consumidor de Kafka es un proceso de larga vida pero los productores son scripts de una sola pasada — no tienen el mismo encaje natural en un `docker-compose.yml` pensado para servicios. Quedaron como scripts que se corren a mano con `uv run`, contra el broker Redpanda que sí está containerizado.
 - **La copia del modelo en el Data Lake no se sincroniza sola con el registry de MLflow**, como se explica en 11.4 — si se reentrena y se promueve una versión nueva a `production`, hay que volver a correr `scripts/upload_to_datalake.py` a mano para que la copia del lake quede al día. Es una limitación real de tener dos fuentes de verdad en paralelo, aceptada conscientemente para el alcance de esta sección.
-- **Los controles de seguridad de la sección 14 no se integraron de forma permanente a los servicios de Docker Compose** — se demuestran y verifican contra el código y los datos reales del proyecto en notebooks dedicados, pero la API REST, el esquema GraphQL, el servidor gRPC, el consumidor de streaming y el acceso al Data Lake que corren en producción siguen sin esos controles activos. Es una decisión de alcance explícita: lo que pide el enunciado es demostrar el control aplicado y verificado, no necesariamente dejarlo activo de forma permanente en cada servicio.
+- **Los controles de seguridad de la sección 14 están integrados en el código productivo de las cinco capas no federadas, activos en los servicios de Docker Compose.** Lo que queda fuera de esta entrega es llevarlos a un nivel de madurez operacional mayor — TLS real en gRPC, políticas IAM aplicadas a nivel de servidor en MinIO en vez de documentadas, rotación de secretos, auditoría persistente en vez de en memoria — que son mejoras razonables para una próxima iteración, no parte de esta entrega.
 - **El Hito TP #1 grupal** (equipo, roles, diagrama de arquitectura — mencionado en el enunciado de la Sesión 4) y **el Hito TP #2** (checkpoint del integrador, mencionado en la Sesión 6) están fuera del alcance de este documento, que cubre el trabajo individual sobre el modelo de demanda eléctrica.
